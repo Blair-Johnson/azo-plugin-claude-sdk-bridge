@@ -67,6 +67,22 @@ async def run(args):
                     if command.endswith("/src/managed.mjs")} == bridges
             print(json.dumps({"kind": "model_result", "profile": model, "passed": True,
                               "elapsed_s": round(time.monotonic() - before, 3)}), flush=True)
+        if args.check_usage:
+            stage = "usage"
+            status = ws.observation().state_value("core.status", {})
+            meter = status.get("token_count_estimate")
+            await ws.slash("/usage")
+            await ws.wait_until(lambda obs: obs.state_value("core.inspector", {}).get("title") == "Token Usage", timeout=10)
+            body = ws.observation().state_value("core.inspector", {}).get("body", "")
+            counters = {label: int(value.replace(",", "")) for label, value in
+                        re.findall(r"\*\*([^*]+):\*\* ([\d,]+)", body)}
+            print(json.dumps({"kind": "usage", "meter": meter,
+                              "limit": status.get("token_limit"), "counters": counters,
+                              "missing_report": "no provider report" in body,
+                              "missing_usage_notice_seen": any("No provider input-usage report" in json.dumps(frame)
+                                                               for frame in ws.observation().frames)}), flush=True)
+            assert isinstance(meter, int) and meter > 0, "Status meter has no positive input report"
+            assert "no provider report" not in body, "Usage inspector has no input report"
         passed = True
     except Exception as error:
         obs = ws.observation()
@@ -98,4 +114,5 @@ if __name__ == "__main__":
     parser.add_argument("--home", type=Path, required=True)
     parser.add_argument("--expected-source", type=Path, required=True)
     parser.add_argument("--model", action="append", required=True)
+    parser.add_argument("--check-usage", action="store_true")
     sys.exit(0 if asyncio.run(run(parser.parse_args())) else 1)
