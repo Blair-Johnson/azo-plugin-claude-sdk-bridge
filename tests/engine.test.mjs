@@ -270,7 +270,7 @@ test('cancel and timeouts sanitize errors, close query, and remove private cwd',
   await until(() => f.queries[1].closed === 1);
 });
 
-test('aborted setup never starts a late SDK query and cleans its imported file', async t => {
+test('aborted setup never starts a late SDK query and cleans its imported file', { timeout: 5000 }, async t => {
   let release;
   const gate = new Promise(resolve => { release = resolve; });
   let imported;
@@ -278,6 +278,9 @@ test('aborted setup never starts a late SDK query and cleans its imported file',
     await gate; imported = join(cwd, 'late.jsonl'); await writeFile(imported, 'late');
     return { path: imported, sessionId: randomUUID() };
   } });
+  let setup;
+  const drive = f.manager.drive.bind(f.manager);
+  f.manager.drive = (...args) => (setup = drive(...args));
   const controller = new AbortController();
   const request = f.manager.handle(body([{ role: 'user', content: 'past' }, { role: 'assistant', content: 'answer' },
     { role: 'user', content: 'next' }]), { sessionId: 's', signal: controller.signal });
@@ -285,7 +288,8 @@ test('aborted setup never starts a late SDK query and cleans its imported file',
   controller.abort();
   await assert.rejects(request, { statusCode: 499 });
   release();
-  await delay(20);
+  // Setup's finally owns the second cleanup pass; filesystem work can exceed 20ms.
+  await setup.catch(error => { assert.equal(error.code, 'ENOENT'); });
   assert.equal(f.queries.length, 0);
   if (imported) await assert.rejects(access(imported));
 });

@@ -1,4 +1,5 @@
-# Opt-in fragment: merge this entry under your own llm.models configuration.
+# Managed opt-in fragment: install plugin/claude_sdk_bridge.py in common scope,
+# then merge this entry under your own llm.models configuration.
 # Does not change the default model or use the direct claude_oauth adapter.
 llm:
   models:
@@ -11,7 +12,9 @@ llm:
           blob_media_types: ["image/*"]
       anthropic:
         client:
-          base_url: http://127.0.0.1:8766
+          # Fail closed without the managed plugin; it overrides URL and key at bind.
+          base_url: http://127.0.0.1:1
+          # Compatibility placeholder only: do not export or persist a bridge key.
           api_key_env: AZO_CLAUDE_BRIDGE_KEY
           # Prevent inheritance of ANTHROPIC_AUTH_TOKEN; endpoint uses x-api-key.
           auth_token: local-bridge-not-anthropic

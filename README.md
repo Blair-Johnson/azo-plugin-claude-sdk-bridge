@@ -4,42 +4,46 @@ This optional local provider uses the Claude Agent SDK behind Agent Zoo's existi
 
 The design follows [pi-claude-bridge](https://github.com/elidickinson/pi-claude-bridge), pinned at `7923e38e1de81dd9562e75754061dd631488e7f3`. Claude Code sees only renamed MCP tools. Each handler waits for a result keyed by the model's tool-call ID; it never performs that action. A complete assistant tool batch returns through the Messages endpoint. Agent Zoo executes it normally, and its next request supplies the results that let the SDK continue. The SDK remains an internal inference process, not a replacement for the host tool loop.
 
-## Opt-in setup
+## Managed setup (normal use)
 
 Dependencies are isolated here. Nothing installs into Agent Zoo's root environment, modifies its bundled model catalog, or changes its default model. The lockfiles pin the same Agent SDK and transcript library versions used by the reference adapter.
 
-From this directory, install the optional runtime:
+Install the runtime and common-scope plugin once, from this integration's source directory:
 
 ```sh
-pixi run install
+cd /absolute/path/to/agent-zoo/integrations/claude-sdk-bridge
+pixi install
+pixi run install  # npm ci with the checked-in lockfile
+azo-plugin install "$PWD/plugin/claude_sdk_bridge.py" common
 ```
 
-Use Claude Code's normal login before starting the bridge. The bridge itself does not extract OAuth tokens, run its own login flow, or change extra-usage settings. Verify the account and billing settings you intend to use; SDK acceptance is not proof that a response was charged to plan limits rather than extra usage.
+The plugin installation links the original source file; keep this checkout and its isolated dependencies available. Do not copy the plugin into a different directory: it locates the Node runtime and bridge files relative to its source. Use Claude Code's normal login. The bridge does not extract OAuth tokens, run its own login flow, enable extra usage, or change billing settings.
 
-Generate a separate local bridge key once. This key only authenticates the loopback endpoint; it is not an Anthropic credential.
+Add profiles to your existing `config/models.yaml` using Agent Zoo's Python environment. From the repository root:
 
 ```sh
-mkdir -p "$HOME/.config/azo-claude-bridge"
-chmod 700 "$HOME/.config/azo-claude-bridge"
-umask 077
-openssl rand -hex -out "$HOME/.config/azo-claude-bridge/key" 32
-pixi run start --key-file "$HOME/.config/azo-claude-bridge/key"
+pixi run python integrations/claude-sdk-bridge/configure_local.py \
+    --config /absolute/path/to/config/models.yaml \
+    --model claude-sonnet-sdk-bridge=sonnet \
+    --model claude-opus-sdk-bridge=opus
+azo --model claude-sonnet-sdk-bridge
 ```
 
-In the terminal that launches Agent Zoo, export that same local key and explicitly select the optional model. Use the absolute path of this checkout's example fragment:
+After this one-time setup, launch `azo` normally and select a bridge profile when wanted. There is no server to start, fixed port to reserve, key file to generate, or environment variable to export. The setup helper appends new names, preserves the original prefix, comments, default model, and unrelated catalog entries, and writes the updated config and an exclusive backup with mode 0600. Backups use `.before-managed-claude-sdk-bridge` with a unique numeric suffix when needed; existing backups are never overwritten. Profiles use a conservative 200k context budget and host compaction at 150k, operational limits rather than claims about each model's maximum capacity.
 
-```sh
-export AZO_CLAUDE_BRIDGE_KEY="$(cat "$HOME/.config/azo-claude-bridge/key")"
-azo --config /absolute/path/to/integrations/claude-sdk-bridge/models.example.yaml \
-    --model claude-sonnet-sdk-bridge
-```
+To migrate an old profile, pass `--migrate-existing` with the same explicit `--config` and one `--model PROFILE=SDK_MODEL` per profile to change. Migration only accepts existing `sdk-bridge`-tagged entries in the helper's recognized trailing bridge block, including the old `# Local Claude Agent SDK bridge; key is loopback-only.` marker. It removes the selected profiles' persistent local keys and replaces fixed URLs with managed placeholders. Unrequested entries stay unchanged. Warning comments are retained; ambiguous layouts, aliases, inline comments in edited entries, or unrelated entries in the trailing block are rejected for manual review. Backups can contain old local keys, so keep them private. The helper does not delete old key files or stop a previously launched manual server.
 
-On current Agent Zoo, an explicit config file replaces the top-level sections it supplies: using this fragment replaces `llm` for that launch. To retain your normal catalog, add its entry to your existing `config/models.yaml` instead (or use the local setup command below). The fragment deliberately does not set `llm.default`, `harness.claude_oauth`, or a disabled `api` tag. The `{session_id}` header is resolved by the unchanged native provider and is required by the endpoint. Child Agent Zoo sessions use separate IDs; their model configuration must also select this profile if you want them to use the bridge.
+You can also merge `models.example.yaml` under your existing `llm.models`. Its port-1 loopback URL is deliberately unusable, and `AZO_CLAUDE_BRIDGE_KEY` is only a compatibility placeholder: the plugin overrides both endpoint and key when the backend binds. Without the installed plugin, the profile fails closed rather than reaching Anthropic directly. Supplying the fragment with `azo --config` replaces the top-level `llm` section for that launch; merging it into your existing catalog retains your other models. It does not set `llm.default`, `harness.claude_oauth`, or a disabled `api` tag.
 
-Do not set `ANTHROPIC_CUSTOM_HEADERS` for this profile: ambient SDK headers can override explicit local client headers. The example supplies a harmless local-only `auth_token` to prevent inheriting an unrelated Anthropic bearer token. Its `api_key_env` supplies the actual local key. The bridge never forwards either local credential to Anthropic.
+Do not set `ANTHROPIC_CUSTOM_HEADERS` for bridge profiles: ambient SDK headers can override explicit local client headers. The local-only `auth_token` prevents inheriting an unrelated Anthropic bearer token. The `{session_id}` header is resolved by the unchanged native provider and is required for per-session routing. Child sessions use separate IDs and must select a bridge profile to use it. Local endpoint credentials are never forwarded to Anthropic.
 
-For a persistent local setup without environment exports, run `configure_local.py` with Agent Zoo's Python environment, an explicit `--config /path/to/config/models.yaml`, a private `--key-file /path/to/bridge/key`, and one or more `--model PROFILE=SDK_MODEL` arguments. It appends new profiles, preserves existing entries and the default, writes a mode-0600 backup, and stores a generated loopback-only key in the private config and key file without printing it. Existing profile names and backup files are never overwritten. Start the server with that same `--key-file`. The resulting profiles use a conservative 200k context budget with host compaction at 150k; these are operational limits, not claims about each model's maximum capacity.
-The server binds only `127.0.0.1:8766`. `--port`, `--idle-seconds` (default 300), `--timeout-seconds` (120), `--max-sessions` (16), and `--system-prompt-mode` (`append` or `custom`) are configurable. Change the profile's `base_url` if you change the port. Stop the foreground server with Ctrl-C. `GET /health` requires the local `x-api-key`; `DELETE /v1/session` additionally requires `x-azo-session-id` and explicitly cancels that SDK session. There is no unauthenticated management endpoint or CORS access.
+Fable profiles require usage credits on the actual Claude account. Selecting a model does not enable credits or alter billing settings. Check the account you intend to use; SDK acceptance alone is not proof that a response used subscription limits rather than extra usage.
+
+## Managed lifecycle
+
+The common-scope Feature manages one loopback Node sidecar per backend, with an OS-assigned port and a fresh ephemeral key. Only tagged bridge profiles are patched in memory; endpoint credentials are not written into model configuration. The lightweight Node process can remain idle for the backend's lifetime. The Claude SDK inference process is lazy: it starts only when a bridge request needs it, not merely because Agent Zoo launched or a profile was selected.
+
+The sidecar survives Python provider-worker replacement during steering and model switches. This lets compatible requests reuse SDK state rather than tying its lifetime to one provider worker. Changed history or incompatible requests can still require a rebuild. Session resource cleanup releases that Session's bridge state; backend shutdown closes the sidecar and its children. Idle expiry bounds unused SDK queries, including state left parked after switching away from a bridge model. This process ownership is not an OS sandbox; the trust boundary is described below.
 
 ## Host functionality and boundaries
 
@@ -57,7 +61,7 @@ A private temporary working directory prevents accidental loading of project ins
 
 The endpoint is a deliberately narrow Messages adapter, not a general Anthropic API proxy. It accepts automatic tool selection, thinking settings, effort, and a maximum-output-token request. Temperature, top-p/top-k, forced tool choice, server tools, structured-output formats, PDF/document blocks, and unknown request controls are rejected. API prompt-cache markers are ignored for history comparison; the SDK controls its own prompt caching. Incompatible thinking signatures from a different provider must be removed by the host's normal replay conversion, not forged or silently repaired here.
 
-Responses use native Messages SSE framing and forward genuine text/thinking progress during generation. The complete tool batch is registered before the terminal event that allows the host to execute it. Pings cover periods with no model output but are not counted as model progress. If an SDK retry would replace already-published content, the request fails instead of mixing responses; unsupported nonstreaming fallback tool batches also fail rather than guessing a batch boundary. An active disconnect or timeout cancels inference; successful tool handoff keeps the query parked. Closing a UI session while no HTTP request is active is not immediately visible to the sidecar, so idle expiry bounds its lifetime. The bridge never cancels or re-executes already-running host tools.
+Responses use native Messages SSE framing and forward genuine text/thinking progress during generation. The complete tool batch is registered before the terminal event that allows the host to execute it. Pings cover periods with no model output but are not counted as model progress. If an SDK retry would replace already-published content, the request fails instead of mixing responses; unsupported nonstreaming fallback tool batches also fail rather than guessing a batch boundary. An active disconnect or timeout cancels inference; successful tool handoff keeps the query parked. In managed use, Session resource cleanup explicitly releases its SDK state. With the standalone diagnostic server, closing a UI session while no HTTP request is active is not immediately visible, so idle expiry bounds its lifetime. The bridge never cancels or re-executes already-running host tools.
 
 No subscription-billing guarantee is made. This uses the real Agent SDK, without spoofing another client's headers or modifying provider attribution. Anthropic may reject requests or apply account-dependent usage rules. The bridge does not enable extra usage and does not fall back to a metered API key.
 
@@ -65,6 +69,13 @@ No subscription-billing guarantee is made. This uses the real Agent SDK, without
 Mid-answer feedback uses `--interrupt-mode reuse` by default. Agent Zoo cancels its current provider request as usual; the bridge asks the SDK to interrupt rather than waiting for that answer to finish. Once both the interrupt acknowledgement and the old turn's terminal result arrive, it sends only the newly appended feedback on the same Claude process. Repeated feedback arriving during that handshake is combined without sending superseded prompts twice. The acknowledgement must report no queued messages, and the handshake is bounded to 500 ms before falling back to a rebuild.
 
 Claude retains its interrupted partial answer and interruption marker in that live SDK session. These private records are not added to Agent Zoo's saved transcript; a later history rebuild drops them. This is an intentional tradeoff for prompt feedback, not exact transcript equivalence. An unresolved tool call or callback, changed history or request settings, failed interrupt, or nonempty SDK queue instead triggers the safer reconstruction path. The bridge does not substitute Claude Code's synthetic rejected-tool result for a real Agent Zoo outcome. Use `--interrupt-mode rebuild` to require reconstruction on every canceled request. Neither mode interrupts already-running Agent Zoo tools; their execution remains governed by the normal host runtime.
+
+## Standalone CLI (diagnostics only)
+
+Normal managed use does not need this server. For isolated transport debugging, `pixi run start --key-file /path/to/private/diagnostic-key --port 8766` runs the foreground CLI. Supply a separately prepared mode-0600 loopback key and a separate diagnostic client pointed at that exact URL and key; the managed example's port-1 placeholder is not a standalone-server configuration. Do not put diagnostic credentials into your normal managed profiles. Stop the foreground server with Ctrl-C.
+
+The standalone CLI binds only `127.0.0.1`. Options include `--port`, `--idle-seconds` (default 300), `--timeout-seconds` (120), `--max-sessions` (16), and `--system-prompt-mode` (`append` or `custom`). `GET /health` requires the local `x-api-key`; `DELETE /v1/session` additionally requires `x-azo-session-id` and explicitly cancels that SDK session. There is no unauthenticated management endpoint or CORS access. These CLI controls are diagnostic options, not flags to pass to `azo`.
+
 ## Tests and reference map
 
 Run the isolated Node tests from this directory:
@@ -76,10 +87,12 @@ pixi run test
 Run the real Agent Zoo client compatibility tests from the repository root with its normal Python environment:
 
 ```sh
-pixi run python -m pytest -q integrations/claude-sdk-bridge/tests/test_agent_zoo_provider.py
+pixi run python -m pytest -q \
+    integrations/claude-sdk-bridge/tests/test_configure_local.py \
+    integrations/claude-sdk-bridge/tests/test_agent_zoo_provider.py
 ```
 
-The Python test exercises the unchanged `make_llm_fn` in both streaming and JSON modes, first against a deterministic endpoint and then through the actual bridge, real SDK child, MCP callbacks, and loopback fake model API. Install this integration's dependencies before running it. Node tests exercise ID routing, schema fidelity, history import, session lifecycle, HTTP auth, errors, cancellation, and the real SDK against an isolated local fake model server. These are offline protocol tests, not live-account or plan-billing tests.
+The setup tests use temporary config files and synthetic keys. The provider test exercises the unchanged `make_llm_fn` in both streaming and JSON modes, first against a deterministic endpoint and then through the actual bridge, real SDK child, MCP callbacks, and loopback fake model API. Install this integration's dependencies before running it. Node tests exercise ID routing, schema fidelity, history import, session lifecycle, HTTP auth, errors, cancellation, and the real SDK against an isolated local fake model server. These are offline protocol tests, not live-account or plan-billing tests.
 
 The reference's `src/index.ts`, `mcp-server.ts`, and `query-state.ts` motivate `src/engine.mjs` and `src/tools.mjs`. Its `session-sync.ts` and `session-transcript.ts` motivate `src/history.mjs`; `cc-child.ts` and `query-process.ts` motivate `src/child.mjs`. `src/server.mjs` and the model fragment are the Agent Zoo-specific additive boundary. See `THIRD_PARTY_NOTICES.md` for attribution and the reference's MIT license.
 
