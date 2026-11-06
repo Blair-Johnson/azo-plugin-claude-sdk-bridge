@@ -25,7 +25,7 @@ test('default workspaces are distinct private children of system temp, not a sha
 test('custom state parents are created privately and contain only unique workspaces', async t => {
   const parent = join(await root(t), 'private');
   const path = await createWorkspace(parent);
-  assert.equal(dirname(path), parent);
+  assert.equal(dirname(path), await realpath(parent));
   assert.equal((await lstat(parent)).mode & 0o777, 0o700);
   assert.equal((await readdir(parent)).length, 1);
 });

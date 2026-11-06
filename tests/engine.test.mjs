@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile, access } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, access, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { BridgeManager, CONTINUE_AFTER_RESUME_PROMPT } from '../src/engine.mjs';
+import { BridgeManager } from '../src/engine.mjs';
+import { errorText } from '../src/errors.mjs';
 import { canonicalMessages } from '../src/history.mjs';
 import { QueryProcess } from '../src/child.mjs';
 import { EventEmitter } from 'node:events';
@@ -138,6 +139,7 @@ test('locked-down SDK options preserve prompt blocks, thinking, and raw stream c
   assert.equal(o.persistSession, false); assert.equal(o.permissionMode, 'default');
   assert.deepEqual(o.thinking, { type: 'enabled', budgetTokens: 64 }); assert.equal(o.effort, 'high');
   assert.equal(o.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS, '128');
+  assert.equal(o.env.CLAUDE_CODE_SIMPLE, undefined);
   assert.equal((await o.canUseTool('Bash', {})).behavior, 'deny');
   assert.equal((await o.canUseTool(o.allowedTools[0], {})).behavior, 'allow');
   assert.equal(events.filter(e => e.type === 'message_stop').length, 1);
@@ -200,7 +202,7 @@ test('changed canonical history rebuilds even when tool IDs and message counts m
   assert.equal(f.imports[0].messages[0].content[0].text, 'edited');
   assert.deepEqual(f.imports[0].messages, canonicalMessages(changed.messages));
   assert.equal(f.imports[0].model, changed.model);
-  assert.deepEqual(f.queries[1].prompts[0].message.content, [{ type: 'text', text: CONTINUE_AFTER_RESUME_PROMPT }]);
+  assert.deepEqual(f.queries[1].prompts[0].message.content, []);
   assert.ok(f.queries[1].options.resume);
 });
 
@@ -236,6 +238,7 @@ test('SDK exhaustion triggers a clean full-history rebuild on the next turn', as
   await until(() => f.manager.sessions.get('s').session.dead);
   await f.manager.handle(next(input, first, 'another'), { sessionId: 's' });
   assert.equal(f.queries.length, 2); assert.equal(f.imports.length, 1);
+  assert.equal(f.queries[1].options.cwd, f.queries[0].options.cwd);
 });
 
 test('per-session lock, capacity, and idle expiry are enforced', async t => {
@@ -258,7 +261,7 @@ test('anonymous requests have independent ephemeral scopes', async t => {
   assert.equal(f.queries[0].closed, 1); assert.equal(f.queries[1].closed, 1);
 });
 
-test('cancel and timeouts sanitize errors, close query, and remove private cwd', async t => {
+test('cancel and timeouts close query and remove private cwd', async t => {
   const f = await fixture(t, () => {}, { requestTimeoutMs: 100 });
   const first = f.manager.handle(body(), { sessionId: 's' });
   await until(() => f.queries.length === 1);
@@ -270,6 +273,17 @@ test('cancel and timeouts sanitize errors, close query, and remove private cwd',
   await until(() => f.queries[1].closed === 1);
 });
 
+test('requests have no total deadline by default; host stream timeouts own liveness', async t => {
+  const f = await fixture(t, () => {}, { requestTimeoutMs: undefined });
+  assert.equal(f.manager.requestTimeoutMs, 0);
+  const pending = f.manager.handle(body(), { sessionId: 's' });
+  await until(() => f.queries.length === 1);
+  const state = await Promise.race([pending.then(() => 'settled', () => 'settled'),
+    new Promise(resolve => setTimeout(resolve, 300, 'pending'))]);
+  assert.equal(state, 'pending', 'A slow request must not be failed by a bridge-side wall clock');
+  const rejected = assert.rejects(pending, { statusCode: 499 });
+  await f.manager.cancel('s'); await rejected;
+});
 test('aborted setup never starts a late SDK query and cleans its imported file', { timeout: 5000 }, async t => {
   let release;
   const gate = new Promise(resolve => { release = resolve; });
@@ -288,21 +302,11 @@ test('aborted setup never starts a late SDK query and cleans its imported file',
   controller.abort();
   await assert.rejects(request, { statusCode: 499 });
   release();
-  // Setup's finally owns the second cleanup pass; filesystem work can exceed 20ms.
-  await setup.catch(error => { assert.equal(error.code, 'ENOENT'); });
+  // Setup keeps the workspace alive until its late import can be cleaned.
+  await setup;
+  await access(f.manager.sessions.get('s').cwd);
   assert.equal(f.queries.length, 0);
   if (imported) await assert.rejects(access(imported));
-});
-
-test('SDK and sink failures never expose raw messages and always close the query', async t => {
-  const f = await fixture(t, q => q.raw({ type: 'result', subtype: 'error_during_execution', errors: ['secret token'] }));
-  await assert.rejects(f.manager.handle(body(), { sessionId: 's' }), error => {
-    assert.equal(error.statusCode, 502); assert.doesNotMatch(error.publicMessage, /secret/); return true;
-  });
-  assert.equal(f.queries[0].closed, 1);
-  const g = await fixture(t, q => q.respond([{ type: 'text', text: 'answer' }]));
-  await assert.rejects(g.manager.handle(body(), { sessionId: 's', onEvent() { throw new Error('secret sink error'); } }), { statusCode: 502 });
-  assert.equal(g.queries[0].closed, 1);
 });
 
 test('unsupported live input is rejected before SDK creation', async t => {
@@ -337,6 +341,7 @@ test('system prompt mode preserves the entire host prompt and validates configur
     const f = await fixture(t, q => q.respond([{ type: 'text', text: 'ok' }]), { systemPromptMode: 'custom' });
     await f.manager.handle(body(undefined, { system }), { sessionId: 's' });
     assert.deepEqual(f.queries[0].options.systemPrompt, typeof system === 'string' ? system : ['first', 'second']);
+    assert.equal(f.queries[0].options.env.CLAUDE_CODE_SIMPLE, undefined);
   }
   const f = await fixture(t, q => q.respond([{ type: 'text', text: 'ok' }]));
   await f.manager.handle(body(undefined, { system: 'Do not filter this full host instruction.' }), { sessionId: 's' });
@@ -410,7 +415,7 @@ test('removed historical tools map deterministically but are never advertised or
   assert.deepEqual(listed.tools.map(tool => tool.name), ['azo_host_tool']);
   assert.deepEqual(q.options.allowedTools, ['mcp__azo__azo_host_tool']);
   assert.equal((await q.options.canUseTool(historicalName, {})).behavior, 'deny');
-  assert.deepEqual(q.prompts[0].message.content, [{ type: 'text', text: CONTINUE_AFTER_RESUME_PROMPT }]);
+  assert.deepEqual(q.prompts[0].message.content, []);
 });
 
 test('historical and live alias collisions reject before query startup', async t => {
@@ -522,12 +527,6 @@ test('nonstream clients may replace unpublished partial content without leaking 
   assert.equal(answer.id, 'new'); assert.deepEqual(answer.content, [{ type: 'text', text: 'fresh' }]);
 });
 
-test('results-only rebuild opener is the exact reference continuation', () => {
-  assert.equal(CONTINUE_AFTER_RESUME_PROMPT,
-    '[Your session was interrupted and resumed. What precedes this ends with the tool result '
-    + 'you were waiting for. Continue the task from there.]');
-});
-
 for (const steering of ['none', 'same-record', 'separate-records']) {
   test(`rebuild imports adjacent result records before startup: ${steering}`, async t => {
     const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aGVsbG8=' } };
@@ -553,7 +552,7 @@ for (const steering of ['none', 'same-record', 'separate-records']) {
     assert.match(f.queries[0].options.resumeSessionAt, /^[0-9a-f-]{36}$/);
     assert.equal(f.queries[0].prompts[0].client_composed, true);
     assert.deepEqual(f.queries[0].prompts[0].message.content, steering === 'none'
-      ? [{ type: 'text', text: CONTINUE_AFTER_RESUME_PROMPT }] : realPrompt);
+      ? [] : realPrompt);
     const session = f.manager.sessions.get('s').session;
     assert.deepEqual(session.expected, canonicalMessages([...history, { role: 'assistant', content: answer.content }]));
     await until(() => session.ready);
@@ -642,6 +641,7 @@ test('a nonempty interrupt queue forces reconstruction instead of running stale 
   const answer = await f.manager.handle(body([...first.messages, { role: 'user', content: 'new feedback' }]), { sessionId: 's' });
   assert.equal(answer.content[0].text, 'fresh'); assert.equal(f.queries.length, 2);
   assert.ok(f.queries[0].closed);
+  assert.equal(f.queries[1].options.cwd, f.queries[0].options.cwd);
 });
 
 test('an early waiting MCP callback prevents same-process interruption before its stream block arrives', async t => {
@@ -692,3 +692,380 @@ for (const late of ['block', 'callback']) {
     if (callback) assert.equal((await callback).isError, true);
   });
 }
+
+const diagnosticText = 'SECRET prompt=/private/path session=secret-id token=secret-token\n[reason=forged]';
+function diagnostic(reason, phase = 'consume', rebuild = 'initial', action = 'rebuild', exit = '', detail) {
+  return `The Claude SDK session failed. [reason=${reason}]${detail === undefined ? '' : `\n${errorText(detail)}`} [phase=${phase} action=${action} rebuild=${rebuild}${exit}]`;
+}
+function exceptionDiagnostic(error, reason, phase) {
+  return `${errorText(error)} [reason=${reason}] [phase=${phase} action=rebuild rebuild=initial]`;
+}
+function reports(expected, cause) {
+  return error => {
+    assert.equal(error.statusCode, 502);
+    assert.equal(error.message, expected);
+    assert.equal(error.publicMessage, expected, 'SSE receives the complete error details');
+    assert.equal(error.cause, cause, 'the underlying error/envelope is retained');
+    return true;
+  };
+}
+
+function detailedError() {
+  return Object.assign(new Error(diagnosticText, { cause: new Error('underlying provider cause') }),
+    { code: 'PROVIDER_CODE', details: { credential: 'actual-provider-credential', nested: { value: diagnosticText } } });
+}
+
+test('SDK result and assistant errors preserve full envelopes including unknown categories and content', async t => {
+  const cases = [
+    ...['error_during_execution', 'error_max_turns', 'error_max_budget_usd', 'error_max_structured_output_retries',
+      'new_sdk_failure', diagnosticText, { category: diagnosticText }]
+      .map(subtype => [{ type: 'result', subtype }, 'result_error']),
+    [{ type: 'result', subtype: 'success', is_error: true }, 'result_error'],
+    ...['authentication_failed', 'rate_limit', 'new_sdk_category', diagnosticText, { category: diagnosticText }]
+      .map(error => [{ type: 'assistant', error }, 'assistant_error']),
+    [{ type: 'assistant', aborted: true }, 'assistant_aborted'],
+    [{ type: 'assistant', message: { model: '<synthetic>', content: [{ type: 'text', text: diagnosticText }] } }, 'synthetic_assistant'],
+  ];
+  for (const [fields, reason] of cases) {
+    const sdk = { errors: [diagnosticText, detailedError(), { code: 'provider_error', details: diagnosticText }],
+      stderr: diagnosticText, session_id: diagnosticText, result: diagnosticText,
+      message: { content: [{ type: 'text', text: diagnosticText }], details: { provider: diagnosticText } }, ...fields };
+    const f = await fixture(t, q => q.raw(sdk));
+    await assert.rejects(f.manager.handle(body(), { sessionId: 's' }),
+      reports(diagnostic(reason, 'consume', 'initial', 'rebuild', '', sdk), sdk));
+    assert.equal(f.queries[0].closed, 1);
+  }
+  const f = await fixture(t, q => q.raw({ type: 'result', subtype: 'success' }));
+  await assert.rejects(f.manager.handle(body(), { sessionId: 's' }), reports(diagnostic('result_without_message')));
+});
+
+test('startup and iterator exceptions preserve their exact stacks, causes and custom details', async t => {
+  const original = detailedError();
+  assert.ok(errorText(original).includes(original.stack.split('\n').find(line => line.trim().startsWith('at '))));
+  assert.ok(errorText(original).includes('underlying provider cause'));
+  for (const [options, reason, phase, input] of [
+    [{ queryFactory: () => { throw original; } }, 'query_factory_failed', 'query_factory'],
+    [{ queryFactory: async () => { throw original; } }, 'query_factory_failed', 'query_factory'],
+    [{ processFactory: () => { throw original; } }, 'setup_failed', 'setup'],
+    [{ historyImporter: async () => { throw original; } }, 'setup_failed', 'history_import',
+      body([{ role: 'user', content: 'past' }, { role: 'assistant', content: 'answer' }, { role: 'user', content: 'next' }])],
+    [{ queryFactory: () => ({ async *[Symbol.asyncIterator]() { throw original; } }) }, 'iterator_failed', 'iterator'],
+  ]) {
+    const f = await fixture(t, undefined, options);
+    await assert.rejects(f.manager.handle(input ?? body(), { sessionId: 's' }),
+      reports(exceptionDiagnostic(original, reason, phase), original));
+  }
+  for (const original of [diagnosticText, { reason: 'plain thrown object', detail: diagnosticText }]) {
+    const f = await fixture(t, undefined, { queryFactory: () => { throw original; } });
+    await assert.rejects(f.manager.handle(body(), { sessionId: 's' }),
+      reports(exceptionDiagnostic(original, 'query_factory_failed', 'query_factory'), original));
+  }
+  const f = await fixture(t, undefined, { queryFactory: () => ({ async *[Symbol.asyncIterator]() {} }) });
+  await assert.rejects(f.manager.handle(body(), { sessionId: 's' }), reports(diagnostic('iterator_exhausted', 'iterator')));
+});
+
+test('SDK failures supplement the original error with pre-disposal stderr, spawn failure and exit context', async t => {
+  for (const phase of ['query_factory', 'iterator', 'consume']) {
+    const original = detailedError(), spawnError = new Error('spawn EACCES', { cause: new Error('executable denied') });
+    const sdk = { type: 'result', subtype: 'provider_startup_failure', errors: [diagnosticText] };
+    let process;
+    const f = await fixture(t, undefined, { queryFactory: () => {
+      process = f.manager.sessions.get('s').session.process;
+      process.child = { exitCode: 137 };
+      process.stderr = `[earlier stderr truncated]\n${diagnosticText}`;
+      process.spawnError = spawnError;
+      process.markExited();
+      const shutdown = process.shutdown.bind(process);
+      process.shutdown = (...args) => {
+        process.stderr += '\nSHUTDOWN ARTIFACT';
+        process.spawnError = new Error('SHUTDOWN ARTIFACT');
+        return shutdown(...args);
+      };
+      if (phase === 'query_factory') throw original;
+      return { async *[Symbol.asyncIterator]() { if (phase === 'iterator') throw original; yield sdk; } };
+    } });
+    const context = ` [phase=${phase} action=rebuild rebuild=initial exit=137]`
+      + `\nProcess stderr:\n[earlier stderr truncated]\n${diagnosticText}\nProcess spawn error:\n${errorText(spawnError)}`;
+    const expected = phase === 'consume' ? `The Claude SDK session failed. [reason=result_error]\n${errorText(sdk)}`
+      : `${errorText(original)} [reason=${phase === 'iterator' ? 'iterator_failed' : 'query_factory_failed'}]`;
+    await assert.rejects(f.manager.handle(body(), { sessionId: 's' }), reports(expected + context, phase === 'consume' ? sdk : original));
+    assert.match(process.stderr, /SHUTDOWN ARTIFACT/);
+  }
+});
+
+test('replacement setup failures do not acquire diagnostics from the disposed generation', async t => {
+  const original = detailedError();
+  let count = 0;
+  const f = await fixture(t, q => q.respond([{ type: 'text', text: 'done' }]), { processFactory: () => {
+    if (count++) throw original;
+    const process = new QueryProcess();
+    const shutdown = process.shutdown.bind(process);
+    process.shutdown = (...args) => {
+      process.stderr = 'OLD GENERATION SHUTDOWN';
+      process.spawnError = new Error('OLD GENERATION SPAWN');
+      return shutdown(...args);
+    };
+    return process;
+  } });
+  await f.manager.handle(body(), { sessionId: 's' });
+  await assert.rejects(f.manager.handle(body(undefined, { max_tokens: 256 }), { sessionId: 's' }),
+    reports(`${errorText(original)} [reason=setup_failed] [phase=setup action=rebuild rebuild=settings_changed]`, original));
+});
+
+test('process diagnostics are optional for minimal process mocks', async t => {
+  const original = detailedError();
+  const f = await fixture(t, undefined, {
+    processFactory: () => ({ didExit: true, exited: Promise.resolve(), shutdown: async () => true }),
+    queryFactory: () => { throw original; },
+  });
+  await assert.rejects(f.manager.handle(body(), { sessionId: 's' }),
+    reports(exceptionDiagnostic(original, 'query_factory_failed', 'query_factory'), original));
+});
+
+test('validation errors preserve their underlying details without unrelated process output', async t => {
+  const original = Object.assign(detailedError(), { statusCode: 400 });
+  const f = await fixture(t, undefined, { queryFactory: () => {
+    const process = f.manager.sessions.get('s').session.process;
+    process.stderr = 'unrelated process stderr';
+    process.spawnError = new Error('unrelated spawn failure');
+    throw original;
+  } });
+  await assert.rejects(f.manager.handle(body(), { sessionId: 's' }), error => {
+    assert.equal(error.statusCode, 400);
+    assert.equal(error.message, `${errorText(original)} [reason=query_factory_failed]`);
+    assert.equal(error.publicMessage, error.message);
+    assert.equal(error.cause, original);
+    return true;
+  });
+});
+
+test('history, settings and mixed-result rebuild reasons survive failures without altering reconstruction', async t => {
+  for (const reason of ['history_changed', 'settings_changed', 'mixed_results']) {
+    const sdk = { type: 'result', subtype: 'error_during_execution', errors: [diagnosticText] };
+    const f = await fixture(t, (q, _message, n) => n === 1
+      ? q.respond([use('a')], { stop: 'tool_use' }) : q.raw(sdk));
+    const input = body(), first = await f.manager.handle(input, { sessionId: 's' });
+    const changed = next(input, first, [result('a')]);
+    if (reason === 'history_changed') changed.messages[0].content = 'edited';
+    if (reason === 'settings_changed') changed.max_tokens++;
+    if (reason === 'mixed_results') changed.messages.at(-1).content.push({ type: 'text', text: 'steering' });
+    await assert.rejects(f.manager.handle(changed, { sessionId: 's' }), reports(diagnostic('result_error', 'consume', reason, 'rebuild', '', sdk), sdk));
+    assert.equal(f.queries.length, 2);
+    assert.equal(f.queries[0].closed, 1);
+    assert.equal(f.imports.length, 1);
+    assert.deepEqual(f.queries[1].prompts[0].message.content, reason === 'mixed_results' ? [{ type: 'text', text: 'steering' }] : []);
+  }
+});
+
+test('ordinary followup failure reports reuse rather than claiming a rebuild', async t => {
+  const sdk = { type: 'assistant', error: 'rate_limit', message: diagnosticText };
+  const f = await fixture(t, q => q.prompts.length === 1 ? q.respond([{ type: 'text', text: 'done' }]) : q.raw(sdk));
+  const input = body(), answer = await f.manager.handle(input, { sessionId: 's' });
+  await assert.rejects(f.manager.handle(next(input, answer, 'next'), { sessionId: 's' }),
+    reports(diagnostic('assistant_error', 'consume', 'none', 'user', '', sdk), sdk));
+  assert.equal(f.queries.length, 1);
+  assert.equal(f.queries[0].prompts.length, 2);
+});
+
+test('rebuild plans expose static lifecycle and continuation reasons', async t => {
+  const f = await fixture(t);
+  const expected = canonicalMessages(body().messages);
+  const session = { fingerprint: 'same', expected, ready: true, tools: { pendingIds: new Set() } };
+  for (const [value, messages, reason] of [
+    [null, expected, 'initial'],
+    [{ ...session, dead: true }, expected, 'dead'],
+    [{ ...session, expected: null }, expected, 'missing_history'],
+    [{ ...session, interruption: {} }, expected, 'interrupted_history_changed'],
+    [session, expected, 'continuation_shape'],
+  ]) assert.deepEqual(f.manager.plan(value, messages, 'same'), { kind: 'rebuild', reason });
+});
+
+test('rapid retries retain the dead-session rebuild cause and workspace across the pre-request sweep', async t => {
+  const sdk = { type: 'result', subtype: 'error_during_execution', errors: [diagnosticText] };
+  const f = await fixture(t, q => q.raw(sdk));
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await assert.rejects(f.manager.handle(body(), { sessionId: 's' }),
+      reports(diagnostic('result_error', 'consume', attempt ? 'dead' : 'initial', 'rebuild', '', sdk), sdk));
+    assert.equal(f.queries.length, attempt + 1);
+    assert.equal(f.queries[attempt].closed, 1);
+    assert.equal(f.queries[attempt].options.cwd, f.queries[0].options.cwd);
+  }
+});
+
+test('sink failures preserve sync throws and async rejection stacks/causes without unrelated process output', async t => {
+  for (const asyncSink of [false, true]) {
+    const original = detailedError();
+    const f = await fixture(t, q => {
+      const process = f.manager.sessions.get('s').session.process;
+      process.stderr = 'unrelated process stderr';
+      process.spawnError = new Error('unrelated spawn failure');
+      pendingProgress(q);
+    });
+    await assert.rejects(f.manager.handle(body(), { sessionId: 's', onEvent() {
+      if (asyncSink) return Promise.reject(original);
+      throw original;
+    } }), reports(exceptionDiagnostic(original, 'sink_failed', asyncSink ? 'publish' : 'consume'), original));
+    assert.equal(f.queries[0].closed, 1);
+  }
+});
+
+
+test('history and settings rebuilds retain the private slot workspace but clean old imports once', async t => {
+  const f = await fixture(t, q => q.respond([{ type: 'text', text: 'ok' }]));
+  const input = body([{ role: 'user', content: 'past' }, { role: 'assistant', content: 'answer' },
+    { role: 'user', content: 'next' }]);
+  await f.manager.handle(input, { sessionId: 's' });
+  const slot = f.manager.sessions.get('s'), cwd = slot.cwd, first = slot.session;
+  assert.equal((await stat(cwd)).mode & 0o777, 0o700);
+  const imported = first.imported.path;
+  for (const changed of [body(input.messages, { max_tokens: 256 }), body([{ role: 'user', content: 'edited' },
+    ...input.messages.slice(1)])]) {
+    await f.manager.handle(changed, { sessionId: 's' });
+    assert.equal(f.manager.sessions.get('s'), slot);
+    assert.equal(slot.session.cwd, cwd);
+    // The fixture deliberately reuses imported.jsonl: old callbacks cannot unlink it.
+    await f.manager.dispose(first);
+    await f.manager.cleanupFiles(first);
+    await access(imported);
+  }
+  assert.equal(f.queries.length, 3);
+  await f.manager.cancel('s');
+  await assert.rejects(access(cwd), { code: 'ENOENT' });
+  assert.equal(f.manager.sessions.size, 0);
+});
+
+test('named and anonymous slots isolate workspaces; eviction and shutdown remove only their own paths', async t => {
+  const f = await fixture(t, q => q.respond([{ type: 'text', text: 'ok' }]));
+  await Promise.all([f.manager.handle(body(), { sessionId: 'a' }), f.manager.handle(body(), { sessionId: 'b' }),
+    f.manager.handle(body()), f.manager.handle(body())]);
+  const paths = f.queries.map(q => q.options.cwd);
+  assert.equal(new Set(paths).size, 4);
+  const a = f.manager.sessions.get('a'), b = f.manager.sessions.get('b');
+  for (const path of paths.filter(path => path !== a.cwd && path !== b.cwd))
+    await assert.rejects(access(path), { code: 'ENOENT' });
+  a.touched = Date.now() - f.manager.idleMs - 1;
+  await f.manager.sweep();
+  await assert.rejects(access(a.cwd), { code: 'ENOENT' });
+  await access(b.cwd);
+  await f.manager.handle(body(), { sessionId: 'a' });
+  const replacement = f.manager.sessions.get('a');
+  assert.notEqual(replacement.cwd, a.cwd);
+  await f.manager.close();
+  await assert.rejects(access(b.cwd), { code: 'ENOENT' });
+  await assert.rejects(access(replacement.cwd), { code: 'ENOENT' });
+});
+
+test('a stubborn old child blocks rebuild without removing cwd; late exit permits same-cwd rebuild', async t => {
+  const child = new EventEmitter(); child.stderr = new EventEmitter(); child.kill = () => true;
+  const f = await fixture(t, (q, _message, n) => {
+    if (n === 1) q.options.spawnClaudeCodeProcess({ command: 'stub', args: [], env: {} });
+    q.respond([{ type: 'text', text: 'ok' }]);
+  }, { processFactory: () => new QueryProcess({ graceMs: 2, killMs: 2, spawnFactory: () => child }) });
+  await f.manager.handle(body(), { sessionId: 's' });
+  const slot = f.manager.sessions.get('s'), cwd = slot.cwd;
+  const changed = body(undefined, { max_tokens: 256 });
+  await assert.rejects(f.manager.handle(changed, { sessionId: 's' }), { statusCode: 503 });
+  assert.equal(slot.session.process.didExit, false);
+  await access(cwd);
+  assert.equal(f.queries.length, 1);
+  child.emit('close', 0, 'SIGKILL');
+  await f.manager.handle(changed, { sessionId: 's' });
+  assert.equal(f.queries.length, 2);
+  assert.equal(f.queries[1].options.cwd, cwd);
+  await access(cwd);
+});
+
+test('shutdown retains a live child workspace and capacity until its actual exit', async t => {
+  const child = new EventEmitter(); child.stderr = new EventEmitter(); child.kill = () => true;
+  const f = await fixture(t, q => {
+    q.options.spawnClaudeCodeProcess({ command: 'stub', args: [], env: {} });
+    q.respond([{ type: 'text', text: 'ok' }]);
+  }, { processFactory: () => new QueryProcess({ graceMs: 2, killMs: 2, spawnFactory: () => child }) });
+  await f.manager.handle(body(), { sessionId: 's' });
+  const slot = f.manager.sessions.get('s');
+  await f.manager.close();
+  assert.equal(f.manager.sessions.get('s'), slot);
+  await access(slot.cwd);
+  child.emit('close', 0, 'SIGKILL');
+  await until(() => !f.manager.sessions.size);
+  await assert.rejects(access(slot.cwd), { code: 'ENOENT' });
+});
+
+test('aborted import blocks replacement setup until cleanup then reuses cwd without late deletion', async t => {
+  let release, importing = false, calls = 0;
+  const gate = new Promise(resolve => { release = resolve; });
+  const f = await fixture(t, q => q.respond([{ type: 'text', text: 'ok' }]), { historyImporter: async ({ cwd }) => {
+    if (++calls === 1) { importing = true; await gate; }
+    const path = join(cwd, 'same-import.jsonl');
+    await writeFile(path, '{}');
+    return { path, sessionId: randomUUID() };
+  } });
+  const input = body([{ role: 'user', content: 'past' }, { role: 'assistant', content: 'answer' },
+    { role: 'user', content: 'next' }]);
+  const controller = new AbortController();
+  const pending = f.manager.handle(input, { sessionId: 's', signal: controller.signal });
+  await until(() => importing);
+  const slot = f.manager.sessions.get('s'), old = slot.session, cwd = slot.cwd;
+  controller.abort();
+  await assert.rejects(pending, { statusCode: 499 });
+  await assert.rejects(f.manager.handle(input, { sessionId: 's' }), { statusCode: 503 });
+  assert.equal(slot.session, old);
+  assert.equal(calls, 1);
+  await access(cwd);
+  release();
+  await old.setup.promise;
+  await assert.rejects(access(join(cwd, 'same-import.jsonl')), { code: 'ENOENT' });
+  await f.manager.handle(input, { sessionId: 's' });
+  assert.equal(slot.session.cwd, cwd);
+  await f.manager.cleanupFiles(old);
+  await access(slot.session.imported.path);
+});
+
+for (const phase of ['import', 'query']) {
+  test(`removal during delayed ${phase} keeps workspace reserved until setup settles`, async t => {
+    let release, entered = false, cwd, lateQuery;
+    const gate = new Promise(resolve => { release = resolve; });
+    const overrides = phase === 'import' ? { historyImporter: async value => {
+      cwd = value.cwd; entered = true; await gate;
+      const path = join(cwd, 'late.jsonl'); await writeFile(path, '{}');
+      return { path, sessionId: randomUUID() };
+    } } : { queryFactory: async value => {
+      cwd = value.options.cwd; entered = true; await gate;
+      await access(cwd);
+      lateQuery = { closed: false, close() { this.closed = true; } };
+      return lateQuery;
+    } };
+    const f = await fixture(t, undefined, overrides);
+    const input = body([{ role: 'user', content: 'past' }, { role: 'assistant', content: 'answer' },
+      { role: 'user', content: 'next' }]);
+    const pending = f.manager.handle(input, { sessionId: 's' });
+    await until(() => entered);
+    const rejected = assert.rejects(pending, { statusCode: 499 });
+    const slot = f.manager.sessions.get('s');
+    await f.manager.cancel('s'); await rejected;
+    assert.equal(f.manager.sessions.get('s'), slot);
+    await access(cwd);
+    await assert.rejects(f.manager.handle(input, { sessionId: 's' }), { statusCode: 409 });
+    release();
+    await until(() => !f.manager.sessions.has('s'));
+    await assert.rejects(access(cwd), { code: 'ENOENT' });
+    if (phase === 'query') assert.equal(lateQuery.closed, true);
+    assert.equal(f.queries.length, 0);
+  });
+}
+
+
+test('cancellation during workspace allocation cleans the late-created directory without starting a query', async t => {
+  let slot, cancelled;
+  const f = await fixture(t, undefined, { processFactory: () => {
+    queueMicrotask(() => { slot = f.manager.sessions.get('s'); cancelled = f.manager.cancel('s'); });
+    return new QueryProcess();
+  } });
+  await assert.rejects(f.manager.handle(body(), { sessionId: 's' }), { statusCode: 499 });
+  await cancelled;
+  await slot.session.setup.promise;
+  await until(() => !f.manager.sessions.has('s'));
+  assert.ok(slot.cwd, 'allocation finished after cancellation');
+  await assert.rejects(access(slot.cwd), { code: 'ENOENT' });
+  assert.equal(f.queries.length, 0);
+});

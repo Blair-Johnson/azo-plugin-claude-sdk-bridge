@@ -68,11 +68,19 @@ test('DELETE session is explicit and authenticated', async t => {
   assert.deepEqual(calls, [{ canceled: 'session-1' }]);
 });
 
-test('unsafe SDK error detail is not exposed', async t => {
-  const { send } = await fixture(t, { async handle() { throw new Error('secret-token and private prompt'); } });
+test('JSON failures preserve SDK messages, stacks, causes and response details', async t => {
+  const error = Object.assign(new Error('provider rejected token=synthetic-token', {
+    cause: new Error('upstream response detail'),
+  }), { response: { request_id: 'synthetic-request', detail: 'invalid signature' } });
+  const { send } = await fixture(t, { async handle() { throw error; } });
   const response = await send();
   assert.equal(response.status, 502);
-  assert.doesNotMatch(await response.text(), /secret-token|private prompt/);
+  const { error: failure } = await response.json();
+  assert.ok(failure.message.includes(error.stack.split('\n').slice(0, 2).join('\n')));
+  assert.match(failure.message, /token=synthetic-token/);
+  assert.match(failure.message, /upstream response detail/);
+  assert.match(failure.message, /synthetic-request/);
+  assert.match(failure.message, /invalid signature/);
 });
 
 test('known public errors keep HTTP status', async t => {
@@ -103,11 +111,15 @@ test('SSE uses native events and successful completion does not abort parked que
   assert.equal(signal.aborted, false);
 });
 
-test('stream failure produces a safe terminal error', async t => {
-  const { send } = await fixture(t, { async handle() { throw new Error('PRIVATE'); } });
+test('stream failure preserves the actual error and cause in its terminal event', async t => {
+  const error = new Error('actual SDK failure', { cause: new Error('provider body detail') });
+  const { send } = await fixture(t, { async handle() { throw error; } });
   const text = await (await send({ ...body, stream: true })).text();
   assert.match(text, /event: error/);
-  assert.doesNotMatch(text, /PRIVATE/);
+  const event = text.split('\n').find(line => line.startsWith('data: ') && line.includes('"type":"error"'));
+  const failure = JSON.parse(event.slice(6)).error;
+  assert.ok(failure.message.includes(error.stack.split('\n').slice(0, 2).join('\n')));
+  assert.match(failure.message, /provider body detail/);
 });
 
 test('timeout aborts manager and terminates response even if manager ignores signal', async t => {
@@ -185,5 +197,16 @@ test('request validation explains unsupported root tool schemas', () => {
     assert.throws(() => validateRequest({ ...body, tools: [{ name: 'root_schema',
       input_schema: { type: 'object', [key]: [{ required: ['value'] }] },
     }] }), error => error.statusCode === 400 && /Top-level anyOf\/oneOf\/allOf/.test(error.publicMessage));
+  }
+});
+
+test('non-Error SDK failures retain their complete supplied value', async t => {
+  for (const detail of ['actual thrown string', { error: { code: 'new_sdk_category', message: 'actual body' } }]) {
+    const { send } = await fixture(t, { async handle() { throw detail; } });
+    const response = await send();
+    assert.equal(response.status, 502);
+    const failure = (await response.json()).error.message;
+    if (typeof detail === 'string') assert.equal(failure, detail);
+    else { assert.match(failure, /new_sdk_category/); assert.match(failure, /actual body/); }
   }
 });

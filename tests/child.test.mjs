@@ -37,6 +37,19 @@ test('child environment removes metered routing but leaves SDK-owned login alone
   assert.equal(env.CLAUDE_CONFIG_DIR, '/private/claude');
   assert.equal(env.ENABLE_CLAUDEAI_MCP_SERVERS, '0');
   assert.equal(env.DISABLE_AUTO_COMPACT, '1');
+  assert.equal(env.CLAUDE_CODE_SIMPLE, undefined);
+  for (const [inherited, override] of [['1', undefined], ['0', '1'], ['1', '1']]) {
+    const normalMode = childEnvironment({
+      CLAUDE_CODE_SIMPLE: inherited, HOME: '/home/test', CLAUDE_CONFIG_DIR: '/private/claude',
+      CLAUDE_CODE_OAUTH_TOKEN: 'sdk-owned', ANTHROPIC_API_KEY: 'must-not-route',
+    }, { CLAUDE_CODE_SIMPLE: override });
+    assert.ok(Object.hasOwn(normalMode, 'CLAUDE_CODE_SIMPLE'), 'Shadow the SDK process.env merge');
+    assert.equal(normalMode.CLAUDE_CODE_SIMPLE, undefined, 'Simple mode disables stored OAuth discovery');
+    assert.equal(normalMode.HOME, '/home/test');
+    assert.equal(normalMode.CLAUDE_CONFIG_DIR, '/private/claude');
+    assert.equal(normalMode.CLAUDE_CODE_OAUTH_TOKEN, 'sdk-owned');
+    assert.equal(normalMode.ANTHROPIC_API_KEY, undefined);
+  }
   assert.equal(isolatedSettings.disableAllHooks, true);
   assert.deepEqual(isolatedSettings.enabledPlugins, {});
 });
@@ -56,8 +69,11 @@ test('process drains stderr, observes actual close, and cannot spawn twice', asy
   assert.deepEqual(spawnOptions.stdio, ['pipe', 'pipe', 'pipe']);
   assert.equal(child.listenerCount('data'), 0);
   assert.equal(child.stderr.listenerCount('data'), 1);
-  child.stderr.emit('data', Buffer.from('SECRET MUST NOT BE LOGGED'));
-  child.emit('error', new Error('SECRET'));
+  child.stderr.emit('data', Buffer.from('actual SDK stderr with token=synthetic-token'));
+  const spawnError = new Error('actual spawn error');
+  child.emit('error', spawnError);
+  assert.equal(process.stderr, 'actual SDK stderr with token=synthetic-token');
+  assert.equal(process.spawnError, spawnError);
   assert.throws(() => process.spawn({}), /already/);
   let closed = 0;
   assert.equal(await process.shutdown({ close() { closed++; } }, new AbortController()), true);
@@ -95,4 +111,19 @@ test('closing before deferred spawn seals the process hook', async () => {
   assert.equal(await process.shutdown(), true);
   assert.throws(() => process.spawn({}), /closed/);
   assert.equal(spawned, false);
+});
+
+test('stderr capture preserves split UTF-8 and marks a bounded recent tail', async () => {
+  const child = childStub({ exitOn: 'SIGTERM' });
+  const process = new QueryProcess({ spawnFactory: () => child, graceMs: 10, killMs: 10 });
+  process.spawn({ command: 'stub', args: [], env: {} });
+  const unicode = Buffer.from('SDK failure: 🐛');
+  child.stderr.emit('data', unicode.subarray(0, unicode.length - 2));
+  child.stderr.emit('data', unicode.subarray(unicode.length - 2));
+  assert.equal(process.stderr, 'SDK failure: 🐛');
+  child.stderr.emit('data', Buffer.from('x'.repeat(70000) + 'last error detail'));
+  assert.ok(process.stderr.startsWith('[earlier stderr truncated]\n'));
+  assert.ok(process.stderr.endsWith('last error detail'));
+  assert.ok(process.stderr.length < 65600);
+  await process.shutdown();
 });

@@ -66,7 +66,9 @@ def test_native_provider_owns_tool_execution(monkeypatch, stream, fixture):
     finally:
         process.terminate()
         try:
-            process.communicate(timeout=5)
+            _, stderr = process.communicate(timeout=5)
         except subprocess.TimeoutExpired:
             process.kill()
-            process.communicate(timeout=5)
+            _, stderr = process.communicate(timeout=5)
+        if stderr:
+            print(stderr)  # Pytest exposes synthetic fixture diagnostics on failure.

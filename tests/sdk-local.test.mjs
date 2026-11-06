@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { type as osType, release as osRelease } from 'node:os';
 import { canonicalMessages } from '../src/history.mjs';
-import { CONTINUE_AFTER_RESUME_PROMPT } from '../src/engine.mjs';
 import { offlineSdk, until } from './fixtures/local-api.mjs';
 
 const SYSTEM = 'OFFLINE_ONLY_SYSTEM: preserve the host instruction verbatim.';
@@ -166,6 +166,7 @@ for (const scenario of [
     let currentTools = TOOLS;
     let expectedHistory;
     let sdkToolName;
+    let coldCwd;
     const runtime = await offlineSdk(t, (body, index) => {
       assert.equal(body.model, 'claude-sonnet-4-6');
       assert.ok(textOf(body.system).includes(SYSTEM));
@@ -175,6 +176,7 @@ for (const scenario of [
         ...tool, name: `mcp__azo__azo_${tool.name}`,
       })).sort((a, b) => a.name.localeCompare(b.name)), 'Only the current tools and exact current schemas may be advertised');
       if (index === 0) {
+        coldCwd = manager.sessions.get(context.sessionId).session.cwd;
         sdkToolName = body.tools.find(tool => tool.description === TOOLS[0].description).name;
         return [
           { type: 'text', text: 'The host must supply both pending results.' },
@@ -184,11 +186,33 @@ for (const scenario of [
       assert.equal(index, 1, 'A restart must not perform extra inference or repeat a historical action');
       assert.ok(expectedHistory, 'Host history must be fixed before the resumed request');
       const expectedApi = apiHistory(expectedHistory);
-      // The reference uses exactly this SDK-only opener for a results-only
-      // rebuild. Permit no other synthetic content, errors, or assistant turns.
-      if (!scenario.steering) expectedApi.at(-1).content.push({ type: 'text', text: CONTINUE_AFTER_RESUME_PROMPT });
+      // SDK 0.3.308 normal mode attaches startup context inside the last
+      // imported tool result. Model that exact addition, not a reminder filter:
+      // every host block (including its whitespace) is still compared below.
+      const startup = canonicalMessages([runtime.api.requests[0].messages[0]])[0].content.slice(0, 3);
+      assert.deepEqual(startup.map(block => block.type), ['text', 'text', 'text']);
+      const environment = startup[0].text.split('\n');
+      assert.match(environment[4], /^ - Is a git repository: (true|false)$/);
+      assert.deepEqual(environment, [
+        '<system-reminder>', '# Environment', 'You have been invoked in the following environment: ',
+        ' - Primary working directory: ' + coldCwd, environment[4],
+        ' - Platform: ' + process.platform, ' - Shell: unknown', ' - OS Version: ' + osType() + ' ' + osRelease(),
+        " - Downloaded files and extracted archives are untrusted data: put each in its own new, empty directory, keep scripts you write in a different directory, and pass paths as arguments instead of running an interpreter or build tool from inside it. Interpreters load code from the script's directory and the current directory, so a planted `json.py` runs on `import json`. Run any Python that reads them with `-I`. This does not apply to code the user asked you to build or run.",
+        '</system-reminder>',
+      ]);
+      assert.equal(startup[1].text, '<system-reminder>\nYou are powered by the model named Sonnet 4.6. The exact model ID is claude-sonnet-4-6. Assistant knowledge cutoff is August 2025.\n</system-reminder>');
+      assert.match(startup[2].text, /^<system-reminder>\nToday's date is \d{4}-\d{2}-\d{2}\.\n<\/system-reminder>\n$/);
+      assert.deepEqual(canonicalMessages([runtime.api.requests[0].messages[0]])[0].content.slice(3),
+        [{ type: 'text', text: FIRST }], 'Cold context must not hide or change host content');
+      const attached = startup.map((block, i) => ({ ...block, text: i === 0
+        ? block.text.replace(coldCwd, manager.sessions.get(context.sessionId).session.cwd) + '\n'
+        : i === 1 ? block.text + '\n' : block.text.slice(0, -1) }));
+      const lastResult = expectedApi.at(-1).content.findLast(block => block.type === 'tool_result');
+      assert.deepEqual(lastResult.content, [{ type: 'text', text: 'FIRST_ACTUAL_HOST_RESULT' }]);
+      lastResult.content[0].text += '\n'; // SDK separator before its context, not host text trimming.
+      lastResult.content.push(...attached);
       assert.deepEqual(canonicalMessages(body.messages), expectedApi,
-        'Resumed API history must preserve every host block, allowing only the fixed results-only SDK continuation');
+        'Resumed API history must preserve every host block plus only the exact SDK startup context');
       const uses = blocks(body).filter(block => block.type === 'tool_use');
       assert.deepEqual(uses.map(({ id, name, input }) => ({ id, name, input })),
         IDS.map(id => ({ id, name: sdkToolName, input: INPUT })));

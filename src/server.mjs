@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { invalid, validateRequest, validateSessionId } from './request.mjs';
+import { errorText } from './errors.mjs';
 
 const hash = s => createHash('sha256').update(s).digest();
 const loopback = address => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(address);
@@ -11,7 +12,7 @@ function errorBody(error) {
   const type = status === 429 ? 'rate_limit_error' : status === 401 ? 'authentication_error' :
     status >= 500 ? 'api_error' : 'invalid_request_error';
   return { status, body: { type: 'error', error: { type,
-    message: error?.publicMessage || 'Claude SDK bridge failed. Check Claude Code login and bridge configuration.' } } };
+    message: errorText(error) } } };
 }
 
 function json(res, status, body) {
@@ -36,7 +37,7 @@ async function readBody(req, limit) {
 
 // HTTP transport only. The SDK manager owns queries; Agent Zoo owns tool effects.
 export function createBridgeServer({ manager, key, maxBodyBytes = 32 * 1024 * 1024,
-  requestTimeoutMs = 120000, pingMs = 10000 } = {}) {
+  requestTimeoutMs = 0, pingMs = 10000 } = {}) {
   if (!manager || typeof key !== 'string' || key.length < 32)
     throw new Error('A manager and local bridge key of at least 32 characters are required.');
   const secret = hash(key);
@@ -74,7 +75,6 @@ export function createBridgeServer({ manager, key, maxBodyBytes = 32 * 1024 * 10
     }
   });
   server.headersTimeout = 15000;
-  server.requestTimeout = requestTimeoutMs;
   server.maxRequestsPerSocket = 100;
   return {
     server,
@@ -102,8 +102,9 @@ async function respond(manager, body, { req, res, sessionId, active, requestTime
   const disconnected = () => { if (!complete) controller.abort(); };
   req.once('aborted', disconnected);
   res.once('close', disconnected);
-  const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
-  timer.unref();
+  // Optional total deadline (0 = none). Disconnects still cancel inference.
+  const timer = requestTimeoutMs > 0 ? setTimeout(() => controller.abort(), requestTimeoutMs) : undefined;
+  timer?.unref();
   const send = event => {
     if (controller.signal.aborted || res.destroyed || res.writableEnded) return;
     if (res.writableLength > 16 * 1024 * 1024) {

@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
 
 // Undefined entries deliberately shadow SDK merges with process.env. Authentication
 // remains the SDK's responsibility; do not inspect credential files or tokens here.
@@ -13,6 +14,8 @@ export function childEnvironment(parent = process.env, overrides = {}) {
   }
   return {
     ...env,
+    // Simple mode disables stored Claude OAuth login; preserve normal SDK authentication.
+    CLAUDE_CODE_SIMPLE: undefined,
     ENABLE_CLAUDEAI_MCP_SERVERS: '0',
     DISABLE_AUTO_COMPACT: '1',
     DISABLE_AUTOUPDATER: '1',
@@ -56,6 +59,9 @@ export class QueryProcess {
     this.sealed = false;
     this.didExit = false;
     this.shutdownPromise = null;
+    this.stderr = '';
+    this.stderrDecoder = new StringDecoder('utf8');
+    this.spawnError = null;
     this.exited = new Promise(resolve => { this.resolveExit = resolve; });
   }
 
@@ -70,13 +76,22 @@ export class QueryProcess {
       windowsHide: true,
     });
     this.child = child;
-    // Drain without logging: CLI stderr can contain credentials or user content.
-    child.stderr?.on('data', () => {});
-    child.on('error', () => {});
-    child.once('close', () => this.markExited());
+    child.stderr?.on('data', chunk => this.recordStderr(
+      typeof chunk === 'string' ? chunk : this.stderrDecoder.write(chunk)));
+    child.on('error', error => { this.spawnError = error; });
+    child.once('close', () => {
+      this.recordStderr(this.stderrDecoder.end());
+      this.markExited();
+    });
     return child;
   };
 
+  recordStderr(text) {
+    this.stderr += text;
+    if (this.stderr.length > 65536) {
+      this.stderr = '[earlier stderr truncated]\n' + this.stderr.slice(-65536);
+    }
+  }
   markExited() {
     this.didExit = true;
     this.resolveExit();

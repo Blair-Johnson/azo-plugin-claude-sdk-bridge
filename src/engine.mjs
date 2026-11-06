@@ -4,21 +4,28 @@ import { createWorkspace } from './workspace.mjs';
 import { ToolBridge } from './tools.mjs';
 import { canonicalMessages, digest, importSession, requestFingerprint, validateHistory } from './history.mjs';
 import { childEnvironment, isolatedSettings, QueryProcess } from './child.mjs';
+import { errorText } from './errors.mjs';
 
 export class BridgeError extends Error {
-  constructor(statusCode, publicMessage) {
-    super(publicMessage);
+  constructor(statusCode, publicMessage, options) {
+    super(publicMessage, options);
     this.name = 'BridgeError';
     this.statusCode = statusCode;
     this.publicMessage = publicMessage;
   }
 }
 const bad = message => new BridgeError(400, message);
-const upstream = () => new BridgeError(502, 'The Claude SDK session failed.');
+const upstream = (reason = 'internal_error', detail) => new BridgeError(502,
+  `The Claude SDK session failed. [reason=${reason}]${detail === undefined ? '' : `\n${errorText(detail)}`}`,
+  detail === undefined ? undefined : { cause: detail });
 const clone = value => structuredClone(value);
-function safeError(error) {
+function bridgeError(error, reason = 'internal_error') {
   if (error instanceof BridgeError) return error;
-  return error?.statusCode === 400 ? bad('Unsupported or invalid message/tool content.') : upstream();
+  const status = error?.statusCode;
+  const failure = new BridgeError(Number.isInteger(status) && status >= 400 && status < 500 ? status : 502,
+    `${errorText(error)} [reason=${reason}]`, { cause: error });
+  failure.reason = reason;
+  return failure;
 }
 function deferred() {
   let resolve, reject;
@@ -49,7 +56,7 @@ function promptStream() {
   let ended = false, wake;
   return {
     push(content) {
-      if (ended) throw upstream();
+      if (ended) throw upstream('prompt_stream_closed');
       // Host messages are already composed: never expand mentions/commands or
       // attach CLI-local reminders to them.
       queue.push({ type: 'user', message: { role: 'user', content: clone(content) }, parent_tool_use_id: null, client_composed: true });
@@ -84,12 +91,6 @@ function thinkingOption(thinking) {
   throw bad('Unsupported thinking configuration.');
 }
 
-// Reference-compatible SDK-only opener for a rebuilt turn ending in real tool
-// results. Never add this to request.messages or the host canonical ledger.
-export const CONTINUE_AFTER_RESUME_PROMPT =
-  '[Your session was interrupted and resumed. What precedes this ends with the tool result '
-  + 'you were waiting for. Continue the task from there.]';
-
 function rebuildInput(messages) {
   // Claude Code repairs unresolved imported calls before it reads stdin. Import
   // every actual result first, including batches split over adjacent user records.
@@ -101,7 +102,7 @@ function rebuildInput(messages) {
     const prompt = [...content.slice(lastResult + 1), ...messages.slice(i + 1).flatMap(message => message.content)];
     return {
       prefix: [...messages.slice(0, i), { role: 'user', content: content.slice(0, lastResult + 1) }],
-      prompt: prompt.length ? prompt : [{ type: 'text', text: CONTINUE_AFTER_RESUME_PROMPT }],
+      prompt,
     };
   }
   return { prefix: messages.slice(0, -1), prompt: messages.at(-1).content };
@@ -123,7 +124,7 @@ function appendedFeedback(previous, messages) {
 /** Agent Zoo owns history and tools. SDK sessions are disposable mirrors only. */
 export class BridgeManager {
   constructor({ queryFactory, stateRoot, idleMs = 300000,
-    requestTimeoutMs = 120000, maxSessions = 16, historyImporter = importSession,
+    requestTimeoutMs = 0, maxSessions = 16, historyImporter = importSession,
     processFactory = () => new QueryProcess(), env = process.env, systemPromptMode = 'append',
     interruptMode = 'reuse', interruptTimeoutMs = 500 } = {}) {
     if (!['reuse', 'rebuild'].includes(interruptMode)) throw new TypeError('Invalid interrupt mode');
@@ -133,7 +134,8 @@ export class BridgeManager {
     this.interruptTimeoutMs = interruptTimeoutMs;
     if (!['append', 'custom'].includes(systemPromptMode)) throw new TypeError('Invalid system prompt mode');
     this.systemPromptMode = systemPromptMode;
-    if (![idleMs, requestTimeoutMs, maxSessions].every(n => Number.isFinite(n) && n > 0)
+    if (![idleMs, maxSessions].every(n => Number.isFinite(n) && n > 0)
+        || !Number.isFinite(requestTimeoutMs) || requestTimeoutMs < 0
         || !Number.isInteger(maxSessions)) throw new TypeError('Invalid bridge resource limits');
     this.queryFactory = queryFactory ?? (async options => (await import('@anthropic-ai/claude-agent-sdk')).query(options));
     this.historyImporter = historyImporter;
@@ -162,7 +164,7 @@ export class BridgeManager {
       validateUserMessage(messages.at(-1));
       systemPrompt(body.system);
       thinkingOption(body.thinking);
-    } catch (error) { throw safeError(error); }
+    } catch (error) { throw bridgeError(error); }
     await this.sweep();
     if (this.closing) throw new BridgeError(503, 'The bridge is shutting down.');
     // Anonymous calls never share a scope, including with other anonymous calls.
@@ -184,25 +186,30 @@ export class BridgeManager {
     if (slot?.busy) throw new BridgeError(409, 'A request is already active for this session.');
     if (!slot) {
       if (this.sessions.size >= this.maxSessions) throw new BridgeError(503, 'The bridge session capacity is full.');
-      slot = { key, busy: false, session: null, current: null, touched: Date.now(), closing: false };
+      slot = { key, busy: false, session: null, cwd: null, current: null, touched: Date.now(), closing: false };
       this.sessions.set(key, slot);
     }
     if (slot.closing) throw new BridgeError(409, 'This session is closing.');
     // Validate continuation before installing a sink or releasing any MCP waiter.
     let plan;
     try { plan = this.plan(slot.session, messages, fingerprint); }
-    catch (error) { throw safeError(error); }
+    catch (error) { throw bridgeError(error); }
     slot.busy = true;
     const request = { ...deferred(), messages, onEvent, signal, settled: false, stream: null, complete: null, fallback: null,
-      sdkUuids: new Set() };
+      sdkUuids: new Set(), phase: 'setup' };
     slot.current = request;
     const abort = () => this.cancelRequest(slot, request);
     signal?.addEventListener('abort', abort, { once: true });
-    const timer = setTimeout(() => this.fail(slot, request, new BridgeError(504, 'The Claude SDK request timed out.')), this.requestTimeoutMs);
+    // Off by default: a total deadline kills long but actively streaming answers.
+    // The host's stream idle/progress timeouts own liveness; 0 disables this cap.
+    const timer = this.requestTimeoutMs > 0 ? setTimeout(() => this.fail(slot, request,
+      new BridgeError(504, 'The Claude SDK request timed out.')), this.requestTimeoutMs) : undefined;
     if (signal?.aborted) abort();
     // Sink installation above MUST precede deliver(): it can synchronously wake
     // MCP handlers and produce output for the new HTTP response.
-    this.drive(slot, request, body, fingerprint, plan).catch(error => this.fail(slot, request, safeError(error)));
+    this.drive(slot, request, body, fingerprint, plan).catch(error => this.fail(slot, request,
+      bridgeError(error, request.phase === 'query_factory' ? 'query_factory_failed'
+        : request.phase === 'continuation' ? 'continuation_failed' : 'setup_failed')));
     try {
       return await request.promise;
     } finally {
@@ -216,13 +223,16 @@ export class BridgeManager {
   }
 
   plan(session, messages, fingerprint) {
-    if (!session || session.dead || session.fingerprint !== fingerprint || !session.expected) return { kind: 'rebuild' };
+    if (!session) return { kind: 'rebuild', reason: 'initial' };
+    if (session.dead) return { kind: 'rebuild', reason: 'dead' };
+    if (session.fingerprint !== fingerprint) return { kind: 'rebuild', reason: 'settings_changed' };
+    if (!session.expected) return { kind: 'rebuild', reason: 'missing_history' };
     if (session.interruption) {
       const content = appendedFeedback(session.expected, messages);
-      return content ? { kind: 'steer', content } : { kind: 'rebuild' };
+      return content ? { kind: 'steer', content } : { kind: 'rebuild', reason: 'interrupted_history_changed' };
     }
     const prefix = messages.slice(0, session.expected.length);
-    if (!same(prefix, session.expected)) return { kind: 'rebuild' };
+    if (!same(prefix, session.expected)) return { kind: 'rebuild', reason: 'history_changed' };
     const suffix = messages.slice(session.expected.length);
     const pending = session.tools.pendingIds;
     if (pending.size) {
@@ -236,44 +246,57 @@ export class BridgeManager {
         throw bad('Tool results must match the complete pending model batch.');
       }
       // Never queue steering behind or ahead of a parked MCP batch accidentally.
-      if (results.length !== content.length) return { kind: 'rebuild' };
+      if (results.length !== content.length) return { kind: 'rebuild', reason: 'mixed_results' };
       return { kind: 'results', results };
     }
     if (session.ready && suffix.length === 1 && suffix[0].role === 'user'
         && !(Array.isArray(suffix[0].content) && suffix[0].content.some(b => b.type === 'tool_result'))) {
       return { kind: 'user', content: suffix[0].content };
     }
-    return { kind: 'rebuild' };
+    return { kind: 'rebuild', reason: 'continuation_shape' };
   }
 
   async drive(slot, request, body, fingerprint, plan) {
     if (request.settled || this.closing || slot.closing) return;
+    request.action = plan.kind;
+    request.rebuildReason = plan.kind === 'rebuild' ? plan.reason : 'none';
     if (plan.kind === 'steer') {
       const session = slot.session;
       request.reusing = true;
+      request.phase = 'interrupt';
       const reusable = await session.interruption.promise;
       if (request.settled || this.closing || slot.closing) return;
       if (!reusable || session.dead || session.unsettledTool
           || session.tools.pendingIds.size || session.tools.hasWaitingCalls) {
         request.reusing = false;
-        return this.drive(slot, request, body, fingerprint, { kind: 'rebuild' });
+        return this.drive(slot, request, body, fingerprint, { kind: 'rebuild', reason: 'interrupt_not_reusable' });
       }
       session.interruption = null;
       session.ready = false;
       request.sent = true;
+      request.phase = 'continuation';
       session.prompts.push(plan.content);
+      request.phase = 'iterator';
       return;
     }
     if (plan.kind === 'rebuild') {
+      request.phase = 'dispose';
       await this.dispose(slot.session);
-      if (slot.session && !slot.session.process.didExit) throw new BridgeError(503, 'The previous SDK process is still closing.');
+      if (slot.session && (!slot.session.process.didExit || !slot.session.setupFinished))
+        throw new BridgeError(503, 'The previous SDK process is still closing.');
+      if (slot.session) await this.cleanupFiles(slot.session);
       if (request.settled || this.closing || slot.closing) return;
+      request.phase = 'setup';
       const session = { tools: new ToolBridge(body.tools ?? []), prompts: promptStream(), process: this.processFactory(),
         controller: new AbortController(), query: null, cwd: null, imported: null, expected: null, fingerprint,
-        ready: false, dead: false, emitted: new Set(), cleanupPromise: null, pump: null };
+        ready: false, dead: false, emitted: new Set(), cleanupPromise: null, pump: null, settingUp: true, setupFinished: false, setup: deferred() };
       slot.session = session;
       try {
-        session.cwd = await createWorkspace(this.stateRoot);
+        request.phase = 'workspace';
+        // SDK-generated environment context includes cwd: keep it stable for this host
+        // slot, but private from every other named or anonymous slot.
+        slot.cwd ??= await createWorkspace(this.stateRoot);
+        session.cwd = slot.cwd;
         if (session.dead || request.settled) return;
         const { prefix, prompt } = rebuildInput(request.messages);
         // Historical tools are names only: never advertise or execute them.
@@ -290,6 +313,7 @@ export class BridgeManager {
         const historyNames = new Map([...names].map(name => [name, historyTools.toSdkName(name)]));
         historyTools.close();
         if (prefix.length) {
+          request.phase = 'history_import';
           session.imported = await this.historyImporter({ messages: prefix, cwd: session.cwd, model: body.model,
             toolNameToSdk: name => historyNames.get(name) });
         }
@@ -298,11 +322,12 @@ export class BridgeManager {
         // loading a user-ended transcript. Anchor at the actual final result so
         // that loader-only placeholder never reaches inference. No host record
         // is removed or rewritten; the SDK prompt starts immediately after it.
+        request.phase = 'resume_setup';
         let resumeSessionAt;
         if (prefix.at(-1)?.role === 'user' && session.imported?.path) {
           const records = (await readFile(session.imported.path, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
           resumeSessionAt = records.findLast(record => record.type === 'user')?.uuid;
-          if (!resumeSessionAt) throw upstream();
+          if (!resumeSessionAt) throw upstream('resume_anchor_missing');
         }
         if (session.dead || request.settled) return;
         const options = {
@@ -331,11 +356,7 @@ export class BridgeManager {
           persistSession: false,
           abortController: session.controller,
           spawnClaudeCodeProcess: session.process.spawn,
-          env: childEnvironment(this.env, { CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(body.max_tokens), ENABLE_TOOL_SEARCH: 'false',
-            // A custom system prompt means host-owned context, not hidden CLI
-            // environment/model/date attachments embedded in real tool results.
-            CLAUDE_CODE_SIMPLE: this.systemPromptMode === 'custom' ? '1' : undefined,
-          }),
+          env: childEnvironment(this.env, { CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(body.max_tokens), ENABLE_TOOL_SEARCH: 'false' }),
           ...(session.imported ? { resume: session.imported.sessionId } : { sessionId: randomUUID() }),
           ...(resumeSessionAt ? { resumeSessionAt } : {}),
           ...(body.thinking ? { thinking: thinkingOption(body.thinking) } : {}),
@@ -343,53 +364,64 @@ export class BridgeManager {
         };
         request.sent = true;
         session.prompts.push(prompt);
+        request.phase = 'query_factory';
         session.query = await this.queryFactory({ prompt: session.prompts, options });
         if (session.dead || request.settled) {
-          try { Promise.resolve(session.query?.close?.()).catch(() => {}); } catch { /* sanitized */ }
+          try { Promise.resolve(session.query?.close?.()).catch(() => {}); } catch { /* already cancelled; closing is best effort */ }
           return;
         }
+        request.phase = 'iterator';
         session.pump = this.pump(slot, session).catch(() => {});
       } finally {
-        // Cancellation can race mkdtemp/import/query construction. A second
-        // cleanup pass removes files that appeared after the first pass.
-        if (session.dead || request.settled && !session.query) await this.cleanupFiles(session);
+        // A cancelled setup can still create an import or return a late query.
+        // Do not reuse/remove its slot workspace until all setup work has ended.
+        session.settingUp = false;
+        try {
+          if (session.dead || request.settled && !session.query) await this.cleanupFiles(session);
+        } finally { session.setupFinished = true; session.setup.resolve(); }
       }
     } else {
       const session = slot.session;
-      if (session.dead) throw upstream();
+      request.phase = 'continuation';
+      if (session.dead) throw upstream('session_dead');
       session.ready = false;
       request.sent = true;
       if (plan.kind === 'results') {
         session.tools.deliver(plan.results);
         session.unsettledTool = false;
       } else session.prompts.push(plan.content);
+      request.phase = 'iterator';
     }
   }
 
   async pump(slot, session) {
+    let phase = 'iterator';
     try {
       for await (const message of session.query) {
         if (session.dead) break;
+        phase = 'consume';
         this.consume(slot, session, message);
+        phase = 'iterator';
       }
       if (!session.dead) {
         // Exhaustion is NOT an ordinary SDK result boundary. A later request
         // rebuilds rather than writing into an already exhausted prompt stream.
         session.dead = true;
         if (session.interruption) session.interruption.failure.resolve(false);
-        else if (slot.current && !slot.current.settled) this.fail(slot, slot.current, upstream());
+        else if (slot.current && !slot.current.settled) this.fail(slot, slot.current, upstream('iterator_exhausted'), phase);
       }
     } catch (error) {
       if (session.interruption) session.interruption.failure.resolve(false);
-      else if (!session.dead && slot.current && !slot.current.settled) this.fail(slot, slot.current, safeError(error));
+      else if (!session.dead && slot.current && !slot.current.settled) this.fail(slot, slot.current,
+        bridgeError(error, phase === 'iterator' ? 'iterator_failed' : 'sdk_message_invalid'), phase);
     } finally {
       await this.dispose(session);
     }
   }
 
   consume(slot, session, sdk) {
-    if (sdk.parent_tool_use_id != null) throw upstream(); // subagents are never enabled
-    if (sdk.type === 'system' && sdk.subtype === 'compact_boundary') throw upstream();
+    if (sdk.parent_tool_use_id != null) throw upstream('unexpected_subagent'); // subagents are never enabled
+    if (sdk.type === 'system' && sdk.subtype === 'compact_boundary') throw upstream('unexpected_compaction');
     const hasTool = sdk.type === 'assistant' && !session.emitted.has(sdk.message?.id)
       && sdk.message?.content?.some(block => block.type === 'tool_use')
       || sdk.type === 'stream_event' && sdk.event?.type === 'content_block_start' && sdk.event.content_block?.type === 'tool_use';
@@ -399,14 +431,14 @@ export class BridgeManager {
       if (sdk.type === 'result') session.interruption.result.resolve(sdk);
       return; // Old partials/results must never enter the replacement sink.
     }
-    if (sdk.type === 'assistant' && sdk.aborted) throw upstream();
+    if (sdk.type === 'assistant' && sdk.aborted) throw upstream('assistant_aborted', sdk);
     if (sdk.type === 'result') {
-      if (sdk.subtype !== 'success' || sdk.is_error) throw upstream();
+      if (sdk.subtype !== 'success' || sdk.is_error) throw upstream('result_error', sdk);
       session.ready = true;
       const request = slot.current;
       if (request && !request.settled) {
         const message = request.complete ?? request.fallback;
-        if (!message) throw upstream();
+        if (!message) throw upstream('result_without_message');
         if (!message.stop_reason) message.stop_reason = sdk.stop_reason ?? 'end_turn';
         this.finish(slot, session, request, message, request.stream?.events);
       }
@@ -415,7 +447,8 @@ export class BridgeManager {
     const request = slot.current;
     if (!request || request.settled) return;
     if (sdk.type === 'assistant') {
-      if (sdk.error || sdk.message?.model === '<synthetic>') throw upstream();
+      if (sdk.error) throw upstream('assistant_error', sdk);
+      if (sdk.message?.model === '<synthetic>') throw upstream('synthetic_assistant', sdk);
       if (session.emitted.has(sdk.message?.id)) return; // late per-block SDK echo
       if (sdk.uuid && request.sdkUuids.has(sdk.uuid)) return;
       if (sdk.uuid) request.sdkUuids.add(sdk.uuid);
@@ -423,7 +456,7 @@ export class BridgeManager {
       // discard only unpublished state, never splice two visible responses.
       if (request.stream?.message.id === sdk.message?.id) return;
       if (request.stream) {
-        if (request.stream.published) throw upstream();
+        if (request.stream.published) throw upstream('published_message_replaced');
         request.stream = null;
         request.complete = null;
       }
@@ -439,7 +472,7 @@ export class BridgeManager {
         // Per-block fallbacks with no terminal boundary cannot prove a parallel
         // batch complete. Fail now: waiting for result deadlocks parked MCP calls.
         if (!request.fallback.stop_reason) throw new BridgeError(502,
-          'The Claude SDK returned a tool batch without a completion boundary.');
+          'The Claude SDK returned a tool batch without a completion boundary. [reason=tool_batch_boundary_missing]');
         this.finish(slot, session, request, request.fallback);
       }
       return;
@@ -453,10 +486,10 @@ export class BridgeManager {
     }
     if (event.type === 'message_start') {
       if (session.emitted.has(event.message.id)) { request.ignoredStream = true; return; }
-      if (request.stream?.published) throw upstream();
+      if (request.stream?.published) throw upstream('published_stream_replaced');
       request.complete = null;
       const message = clone(event.message);
-      if (message.content?.length) throw upstream();
+      if (message.content?.length) throw upstream('nonempty_message_start');
       message.content = [];
       event.message = clone(message);
       request.fallback = null;
@@ -464,25 +497,25 @@ export class BridgeManager {
       return;
     }
     const stream = request.stream;
-    if (!stream || stream.stopped) throw upstream();
+    if (!stream || stream.stopped) throw upstream('stream_boundary_invalid');
     if (event.type === 'content_block_start') {
-      if (!Number.isInteger(event.index) || event.index < 0 || stream.blocks.has(event.index)) throw upstream();
+      if (!Number.isInteger(event.index) || event.index < 0 || stream.blocks.has(event.index)) throw upstream('block_index_invalid');
       const block = this.mapBlock(session, event.content_block);
       event.content_block = clone(block);
       stream.blocks.set(event.index, { block, json: '', closed: false });
     } else if (event.type === 'content_block_delta') {
       const entry = stream.blocks.get(event.index);
-      if (!entry || entry.closed) throw upstream();
+      if (!entry || entry.closed) throw upstream('block_boundary_invalid');
       const block = entry.block, delta = event.delta;
       if (delta.type === 'text_delta' && block.type === 'text') block.text += delta.text;
       else if (delta.type === 'thinking_delta' && block.type === 'thinking') block.thinking += delta.thinking;
       else if (delta.type === 'signature_delta' && block.type === 'thinking') block.signature = (block.signature ?? '') + delta.signature;
       else if (delta.type === 'input_json_delta' && block.type === 'tool_use') entry.json += delta.partial_json;
       else if (delta.type === 'citations_delta' && block.type === 'text') (block.citations ??= []).push(delta.citation);
-      else throw upstream();
+      else throw upstream('unsupported_delta');
     } else if (event.type === 'content_block_stop') {
       const entry = stream.blocks.get(event.index);
-      if (!entry || entry.closed) throw upstream();
+      if (!entry || entry.closed) throw upstream('block_boundary_invalid');
       if (entry.json) entry.block.input = JSON.parse(entry.json);
       entry.closed = true;
     } else if (event.type === 'message_delta') {
@@ -490,11 +523,11 @@ export class BridgeManager {
       stream.message.usage = { ...stream.message.usage, ...event.usage };
     } else if (event.type === 'message_stop') {
       const entries = [...stream.blocks.entries()].sort(([a], [b]) => a - b);
-      if (entries.some(([index, entry], i) => index !== i || !entry.closed)) throw upstream();
+      if (entries.some(([index, entry], i) => index !== i || !entry.closed)) throw upstream('incomplete_stream_blocks');
       stream.message.content = entries.map(([, entry]) => entry.block);
       stream.stopped = true;
       request.complete = stream.message;
-    } else throw upstream();
+    } else throw upstream('unsupported_event');
     stream.events.push(event);
     if (stream.stopped && stream.message.stop_reason === 'tool_use') {
       this.finish(slot, session, request, stream.message, stream.events);
@@ -506,7 +539,7 @@ export class BridgeManager {
 
   mapBlock(session, source) {
     const block = clone(source);
-    if (!['text', 'thinking', 'redacted_thinking', 'tool_use'].includes(block?.type)) throw upstream();
+    if (!['text', 'thinking', 'redacted_thinking', 'tool_use'].includes(block?.type)) throw upstream('unsupported_block');
     if (block.type === 'tool_use') block.name = session.tools.fromSdkName(block.name);
     return block;
   }
@@ -514,13 +547,13 @@ export class BridgeManager {
   finish(slot, session, request, source, rawEvents) {
     if (request.settled || session.emitted.has(source.id)) return;
     const message = clone(source);
-    if (typeof message.id !== 'string' || !Array.isArray(message.content)) throw upstream();
+    if (typeof message.id !== 'string' || !Array.isArray(message.content)) throw upstream('invalid_message');
     message.type = 'message';
     message.role = 'assistant';
     message.stop_sequence ??= null;
     message.usage ??= { input_tokens: 0, output_tokens: 0 };
     const calls = message.content.filter(block => block.type === 'tool_use');
-    if (calls.length && message.stop_reason !== 'tool_use' || !calls.length && message.stop_reason === 'tool_use') throw upstream();
+    if (calls.length && message.stop_reason !== 'tool_use' || !calls.length && message.stop_reason === 'tool_use') throw upstream('tool_stop_mismatch');
     if (calls.length) {
       session.tools.expect(message.content);
       session.ready = false;
@@ -540,8 +573,10 @@ export class BridgeManager {
   publish(slot, request, events) {
     for (const event of events) {
       if (request.settled) return;
-      const callback = request.onEvent?.(clone(event));
-      if (callback && typeof callback.then === 'function') callback.catch(() => this.fail(slot, request, upstream()));
+      let callback;
+      try { callback = request.onEvent?.(clone(event)); }
+      catch (error) { throw bridgeError(error, 'sink_failed'); }
+      if (callback && typeof callback.then === 'function') callback.catch(error => this.fail(slot, request, bridgeError(error, 'sink_failed'), 'publish'));
     }
   }
 
@@ -580,7 +615,7 @@ export class BridgeManager {
           interruption.failure.promise,
           new Promise(resolve => { timer = setTimeout(() => resolve(false), this.interruptTimeoutMs); }),
         ]);
-      } catch { /* Fall back without exposing SDK errors or queue contents. */ }
+      } catch { /* The cancelled request is settled; fall back to rebuilding. */ }
       finally { clearTimeout(timer); }
       reusable = Boolean(reusable && !session.dead && !session.unsettledTool
         && !session.tools.pendingIds.size && !session.tools.hasWaitingCalls);
@@ -589,18 +624,35 @@ export class BridgeManager {
       return reusable;
     })();
   }
-  fail(slot, request, error) {
+  fail(slot, request, error, phase = request.phase) {
     if (request.settled) return;
     request.settled = true;
-    request.reject(safeError(error));
+    const failure = bridgeError(error);
+    if (failure.statusCode >= 500) {
+      // Snapshot before disposal; neither an old closing process nor sink failure
+      // should acquire unrelated process/shutdown diagnostics.
+      const process = !slot.session?.cleanupPromise && !['dispose', 'publish'].includes(phase)
+        && failure.reason !== 'sink_failed' ? slot.session?.process : undefined;
+      const exitCode = ['query_factory', 'iterator', 'consume'].includes(phase) ? process?.child?.exitCode : undefined;
+      const exit = Number.isInteger(exitCode) && exitCode >= 0 && exitCode <= 255 ? ` exit=${exitCode}` : '';
+      const context = ` [phase=${phase} action=${request.action} rebuild=${request.rebuildReason}${exit}]`
+        + (process?.stderr ? `\nProcess stderr:\n${process.stderr}` : '')
+        + (process?.spawnError ? `\nProcess spawn error:\n${errorText(process.spawnError)}` : '');
+      failure.message += context;
+      failure.publicMessage += context;
+    }
+    request.reject(failure);
     this.dispose(slot.session).catch(() => {});
   }
 
   async cleanupFiles(session) {
     // A stubborn process must not lose the transcript underneath its live fd.
-    if (!session.process.didExit) return;
-    if (session.imported?.path) await rm(session.imported.path, { force: true }).catch(() => {});
-    if (session.cwd) await rm(session.cwd, { recursive: true, force: true }).catch(() => {});
+    if (!session.process.didExit || session.settingUp) return;
+    // One deletion per generation: late cleanup must not unlink a newer import
+    // that happens to use the same path in the slot-owned workspace.
+    session.filesCleanupPromise ??= session.imported?.path
+      ? rm(session.imported.path, { force: true }).catch(() => {}) : Promise.resolve();
+    await session.filesCleanupPromise;
   }
 
   dispose(session) {
@@ -635,19 +687,30 @@ export class BridgeManager {
     slot.closing = true;
     slot.removing = (async () => {
       if (slot.current && !slot.current.settled) this.fail(slot, slot.current, new BridgeError(499, 'The session was cancelled.'));
-      const forget = () => { if (this.sessions.get(slot.key) === slot) this.sessions.delete(slot.key); };
-      // Install before bounded shutdown: a late close must always free capacity.
-      slot.session?.process.exited.then(forget).catch(() => {});
-      await this.dispose(slot.session);
-      if (!slot.session || slot.session.process.didExit) forget();
-      // A live child keeps its reserved closing slot, not a rejected sweep promise.
+      const session = slot.session;
+      const forget = async () => {
+        if (session) await this.cleanupFiles(session);
+        if (slot.cwd) await rm(slot.cwd, { recursive: true, force: true }).catch(() => {});
+        if (this.sessions.get(slot.key) === slot) this.sessions.delete(slot.key);
+      };
+      await this.dispose(session);
+      if (!session || session.process.didExit && session.setupFinished) {
+        if (session) await session.setup.promise;
+        await forget();
+      } else {
+        // Bounded shutdown must not wait for a stuck child or setup. Keep its
+        // closing slot reserved, then release it only after both have settled.
+        Promise.all([session.process.exited, session.setup.promise]).then(forget).catch(() => {});
+      }
     })();
     return slot.removing;
   }
 
   async sweep() {
     const now = Date.now();
-    await Promise.allSettled([...this.sessions.values()].filter(slot => !slot.busy && (!slot.session || slot.session.dead || now - slot.touched >= this.idleMs))
+    // A dead mirror is replaceable, not an eviction: retain its host slot's cwd
+    // until idle expiry, explicit cancellation, anonymous completion, or shutdown.
+    await Promise.allSettled([...this.sessions.values()].filter(slot => !slot.busy && now - slot.touched >= this.idleMs)
       .map(slot => this.remove(slot)));
   }
 

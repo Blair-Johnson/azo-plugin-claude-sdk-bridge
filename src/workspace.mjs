@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 
@@ -15,7 +15,8 @@ export async function createWorkspace(parent) {
   const path = await mkdtemp(join(parent ?? tmpdir(), 'azo-claude-bridge-'));
   try {
     await chmod(path, 0o700);
-    return path;
+    // The SDK reports the canonical cwd (macOS: /var -> /private/var); match it.
+    return await realpath(path);
   } catch (error) {
     await rm(path, { recursive: true, force: true }).catch(() => {});
     throw error;
