@@ -1,0 +1,13 @@
+[workspace]
+name = "azo-claude-sdk-bridge"
+version = "0.1.0"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64", "linux-aarch64"]
+
+[dependencies]
+nodejs = ">=22,<23"
+
+[tasks]
+install = "npm ci --ignore-scripts --no-audit --no-fund"
+start = "node src/cli.mjs"
+test = "node --test tests/*.test.mjs"

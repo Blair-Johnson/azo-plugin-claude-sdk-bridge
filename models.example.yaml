@@ -1,0 +1,26 @@
+# Opt-in fragment: merge this entry under your own llm.models configuration.
+# Does not change the default model or use the direct claude_oauth adapter.
+llm:
+  models:
+    claude-sonnet-sdk-bridge:
+      tags: [commercial, sdk-bridge]
+      context_window_tokens: 200000
+      harness:
+        disable_mid_conversation_system_messages: true
+        capabilities:
+          blob_media_types: ["image/*"]
+      anthropic:
+        client:
+          base_url: http://127.0.0.1:8766
+          api_key_env: AZO_CLAUDE_BRIDGE_KEY
+          # Prevent inheritance of ANTHROPIC_AUTH_TOKEN; endpoint uses x-api-key.
+          auth_token: local-bridge-not-anthropic
+          max_retries: 0
+          default_headers:
+            x-azo-session-id: "{session_id}"
+        request:
+          model: sonnet
+          max_tokens: 16384
+          stream: true
+          thinking:
+            type: adaptive

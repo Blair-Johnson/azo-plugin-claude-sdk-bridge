@@ -1,0 +1,4 @@
+node_modules/
+.pixi/
+.env
+*.log
