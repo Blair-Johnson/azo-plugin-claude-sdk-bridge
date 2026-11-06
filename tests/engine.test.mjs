@@ -206,14 +206,37 @@ test('changed canonical history rebuilds even when tool IDs and message counts m
   assert.ok(f.queries[1].options.resume);
 });
 
-test('same-request steering with tool results rebuilds instead of queueing across the tool boundary', async t => {
+test('same-request text/images after tool results ride in the last result instead of rebuilding', async t => {
+  const f = await fixture(t, q => q.respond([use('a'), use('b')], { stop: 'tool_use' }));
+  const input = body(); const first = await f.manager.handle(input, { sessionId: 's' });
+  const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'eA==' } };
+  const second = next(input, first, [result('b', 'B'), result('a', 'A'),
+    { type: 'text', text: 'now change direction' }, image]);
+  const pending = f.manager.handle(second, { sessionId: 's' });
+  await until(() => f.manager.sessions.get('s').session.tools.pendingIds.size === 0);
+  const q = f.queries[0];
+  const b = await q.call('b'); const a = await q.call('a');
+  assert.deepEqual(b.content, [{ type: 'text', text: 'B' }]);
+  assert.deepEqual(a.content, [{ type: 'text', text: 'A' }, { type: 'text', text: 'now change direction' },
+    { type: 'image', mimeType: 'image/png', data: 'eA==' }]);
+  q.respond([{ type: 'text', text: 'steered' }]);
+  assert.equal((await pending).content[0].text, 'steered');
+  assert.equal(f.queries.length, 1); assert.equal(q.closed, 0);
+  assert.equal(q.prompts.length, 1, 'Trailing content must not also be queued as a prompt');
+  assert.equal(f.imports.length, 0);
+  assert.deepEqual(f.manager.sessions.get('s').session.expected.at(-2), canonicalMessages(second.messages).at(-1),
+    'Host ledger retains the unfolded user turn');
+});
+
+test('trailing content that cannot ride in a tool result still rebuilds across the tool boundary', async t => {
   const f = await fixture(t, (q, message, n) => n === 1 ? q.respond([use('a')], { stop: 'tool_use' })
     : q.respond([{ type: 'text', text: 'steered' }]));
   const input = body(); const first = await f.manager.handle(input, { sessionId: 's' });
-  const second = next(input, first, [result('a'), { type: 'text', text: 'now change direction' }]);
+  const remote = { type: 'image', source: { type: 'url', url: 'https://example.invalid/a.png' } };
+  const second = next(input, first, [result('a'), { type: 'text', text: 'now change direction' }, remote]);
   await f.manager.handle(second, { sessionId: 's' });
   assert.equal(f.queries.length, 2);
-  assert.deepEqual(f.queries[1].prompts[0].message.content, [{ type: 'text', text: 'now change direction' }]);
+  assert.deepEqual(f.queries[1].prompts[0].message.content, [{ type: 'text', text: 'now change direction' }, remote]);
   assert.deepEqual(f.imports[0].messages, canonicalMessages([...second.messages.slice(0, -1),
     { role: 'user', content: [result('a')] }]));
 });
@@ -848,12 +871,14 @@ test('history, settings and mixed-result rebuild reasons survive failures withou
     const changed = next(input, first, [result('a')]);
     if (reason === 'history_changed') changed.messages[0].content = 'edited';
     if (reason === 'settings_changed') changed.max_tokens++;
-    if (reason === 'mixed_results') changed.messages.at(-1).content.push({ type: 'text', text: 'steering' });
+    // Text/base64 trailing content folds into the batch; a URL image cannot.
+    const remote = { type: 'image', source: { type: 'url', url: 'https://example.invalid/a.png' } };
+    if (reason === 'mixed_results') changed.messages.at(-1).content.push(remote);
     await assert.rejects(f.manager.handle(changed, { sessionId: 's' }), reports(diagnostic('result_error', 'consume', reason, 'rebuild', '', sdk), sdk));
     assert.equal(f.queries.length, 2);
     assert.equal(f.queries[0].closed, 1);
     assert.equal(f.imports.length, 1);
-    assert.deepEqual(f.queries[1].prompts[0].message.content, reason === 'mixed_results' ? [{ type: 'text', text: 'steering' }] : []);
+    assert.deepEqual(f.queries[1].prompts[0].message.content, reason === 'mixed_results' ? [remote] : []);
   }
 });
 

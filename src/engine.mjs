@@ -121,6 +121,25 @@ function appendedFeedback(previous, messages) {
   const content = [...after.content.slice(before.content.length), ...trailing.flatMap(message => message.content)];
   return content.length && content.every(block => ['text', 'image'].includes(block.type)) ? content : null;
 }
+// Agent Zoo appends wake/interrupt notices and steering text after the tool
+// results that close a batch. Rebuilding for that relocates the SDK's startup
+// reminders into older turns and invalidates the upstream prompt cache. Instead,
+// append the trailing text/images verbatim to the last result of the parked batch.
+// Host history is unchanged; only the live SDK mirror carries the folded form.
+function foldTrailingContent(content, resultCount) {
+  if (content.slice(0, resultCount).some(block => block.type !== 'tool_result')) return null;
+  const trailing = content.slice(resultCount);
+  const supported = trailing.every(block => block.type === 'text'
+    ? Object.keys(block).every(key => ['type', 'text'].includes(key))
+    : block.type === 'image' && Object.keys(block).every(key => ['type', 'source'].includes(key))
+      && block.source?.type === 'base64'
+      && Object.keys(block.source).every(key => ['type', 'media_type', 'data'].includes(key)));
+  if (!trailing.length || !supported) return null;
+  const results = clone(content.slice(0, resultCount));
+  const last = results.at(-1);
+  last.content = [...(last.content ?? []), ...clone(trailing)];
+  return results;
+}
 /** Agent Zoo owns history and tools. SDK sessions are disposable mirrors only. */
 export class BridgeManager {
   constructor({ queryFactory, stateRoot, idleMs = 300000,
@@ -245,8 +264,12 @@ export class BridgeManager {
       if (ids.size !== results.length || ids.size !== pending.size || [...ids].some(id => !pending.has(id))) {
         throw bad('Tool results must match the complete pending model batch.');
       }
-      // Never queue steering behind or ahead of a parked MCP batch accidentally.
-      if (results.length !== content.length) return { kind: 'rebuild', reason: 'mixed_results' };
+      // Never queue steering behind or ahead of a parked MCP batch: deliver it
+      // inside the batch, or rebuild when its content cannot ride in a result.
+      if (results.length !== content.length) {
+        const folded = foldTrailingContent(content, results.length);
+        return folded ? { kind: 'results', results: folded } : { kind: 'rebuild', reason: 'mixed_results' };
+      }
       return { kind: 'results', results };
     }
     if (session.ready && suffix.length === 1 && suffix[0].role === 'user'

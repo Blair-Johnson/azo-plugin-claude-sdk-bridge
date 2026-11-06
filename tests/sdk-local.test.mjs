@@ -139,6 +139,63 @@ const CHANGED_TOOLS = [{
   input_schema: { type: 'object', properties: { current: { type: 'boolean' } }, required: ['current'], additionalProperties: false },
 }];
 
+// Agent Zoo appends interrupt/wake notices after a closing result batch. Those
+// must continue the parked query: a rebuild relocates the SDK startup context
+// into older turns and invalidates the upstream prompt cache.
+test('real SDK: parked results plus trailing text continue the query with a stable upstream prefix', { timeout: 60_000 }, async t => {
+  let sdkToolName;
+  const runtime = await offlineSdk(t, (body, index) => {
+    if (index === 0) {
+      sdkToolName = body.tools.find(tool => tool.description === TOOLS[0].description).name;
+      return IDS.map(id => ({ type: 'tool_use', id, name: sdkToolName, input: INPUT }));
+    }
+    return [{ type: 'text', text: index === 1 ? 'OFFLINE_FOLDED_REPLY' : 'OFFLINE_ORDINARY_REPLY' }];
+  });
+  const { api, controller, makeManager, queries, callbacks, settled } = runtime;
+  const manager = makeManager();
+  const base = { model: 'claude-sonnet-4-6', system: SYSTEM, tools: TOOLS, max_tokens: 512, stream: true };
+  const context = { sessionId: 'offline-folded-steering', signal: controller.signal };
+  const history = [{ role: 'user', content: FIRST }];
+  const first = await manager.handle({ ...base, messages: history }, context);
+  assert.equal(first.stop_reason, 'tool_use');
+  await until(() => callbacks.length > 0, { signal: controller.signal });
+
+  history.push(asMessage(first), { role: 'user', content: [
+    { type: 'tool_result', tool_use_id: IDS[1], content: 'SECOND_HOST_RESULT' },
+    { type: 'tool_result', tool_use_id: IDS[0], content: 'FIRST_HOST_RESULT' },
+    { type: 'text', text: STEERING },
+  ] });
+  const original = structuredClone(history);
+  const second = await manager.handle({ ...base, messages: history }, context);
+  assert.deepEqual(history, original, 'Folding must not alter host input history');
+  assert.equal(textOf(second.content), 'OFFLINE_FOLDED_REPLY');
+  assert.equal(queries.length, 1, 'Results plus trailing text must continue the parked query, not rebuild');
+  assert.deepEqual([...settled].sort(), [...IDS].sort());
+  assert.equal(callbacks.length, 2, 'No host tool may be re-executed');
+  assert.deepEqual(manager.sessions.get(context.sessionId).session.expected,
+    canonicalMessages([...history, asMessage(second)]), 'Host ledger keeps the unfolded host form');
+
+  const [cold, folded] = api.requests.map(body => canonicalMessages(body.messages));
+  assert.deepEqual(folded.slice(0, cold.length), cold, 'Upstream prefix (including SDK startup context) must be unchanged');
+  const results = folded.at(-1).content.filter(block => block.type === 'tool_result');
+  assert.deepEqual(results.map(block => block.tool_use_id).sort(), [...IDS].sort());
+  const carrier = results.find(block => textOf(block.content).includes(STEERING));
+  assert.ok(carrier, 'Trailing host text must reach the model inside the batch');
+  assert.equal(carrier.tool_use_id, IDS[0], 'Trailing text rides on the last host result');
+  assert.ok(textOf(carrier.content).includes('FIRST_HOST_RESULT'));
+  assert.ok(!folded.at(-1).content.some(block => block.type === 'text' && block.text.includes('<system-reminder>')),
+    'Continuation must not re-attach SDK startup context');
+
+  history.push(asMessage(second), { role: 'user', content: FOLLOWUP });
+  const third = await manager.handle({ ...base, messages: history }, context);
+  assert.equal(textOf(third.content), 'OFFLINE_ORDINARY_REPLY');
+  assert.equal(queries.length, 1, 'Ordinary follow-up after folding must keep reusing the query');
+  const ordinary = canonicalMessages(api.requests[2].messages);
+  assert.deepEqual(ordinary.slice(0, folded.length), folded, 'Folded turn must stay stable for later cache reads');
+  await manager.close();
+  api.assertHealthy();
+});
+
 function apiHistory(history) {
   // Normalize transport hints, text-block equivalence, MCP aliases, and the
   // API's adjacent-user grouping only. No content/assistant turns disappear.
@@ -158,7 +215,6 @@ for (const scenario of [
   { name: 'restart with results split over adjacent user records', restart: true, split: true },
   { name: 'restart with split results and same-record steering', restart: true, split: true, steering: true },
   { name: 'restart with split results and separate steering records', restart: true, split: true, steering: true, separate: true },
-  { name: 'parked results plus steering rebuild without replay', steering: true },
   { name: 'restart after host compaction with pending results', restart: true, compacted: true },
   { name: 'restart with a removed historical tool and changed current schema', restart: true, changed: true },
 ]) {
