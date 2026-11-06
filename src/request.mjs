@@ -11,7 +11,8 @@ export function validateRequest(value) {
   for (const key of Object.keys(value)) {
     if (!accepted.has(key)) throw invalid(`Unsupported Messages parameter: ${key.slice(0, 64)}.`);
   }
-  if (typeof value.model !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(value.model))
+  if (typeof value.model !== 'string' || value.model.length > 128 || value.model !== value.model.trim()
+      || !/^[A-Za-z0-9._:-]+(?:\[1m\])?$/.test(value.model))
     throw invalid('A model name is required.');
   if (!Array.isArray(value.messages) || !value.messages.length)
     throw invalid('A nonempty messages array is required.');
