@@ -25,9 +25,14 @@ TOOLS = [{"type": "function", "function": {
 
 
 @pytest.mark.parametrize("stream", [True, False])
-@pytest.mark.parametrize("fixture", ["azo-endpoint.mjs", "azo-sdk-endpoint.mjs"])
-def test_native_provider_owns_tool_execution(monkeypatch, stream, fixture):
+@pytest.mark.parametrize("fixture,continuation", [
+    ("azo-endpoint.mjs", False),
+    ("azo-sdk-endpoint.mjs", False),
+    ("azo-sdk-endpoint.mjs", True),
+])
+def test_native_provider_owns_tool_execution(monkeypatch, stream, fixture, continuation):
     monkeypatch.setenv("AZO_CLAUDE_BRIDGE_KEY", KEY)
+    monkeypatch.setenv("AZO_SDK_FIXTURE_CONTINUATION", "1" if continuation else "0")
     for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS"):
         monkeypatch.delenv(name, raising=False)
     process = subprocess.Popen(
@@ -53,10 +58,21 @@ def test_native_provider_owns_tool_execution(monkeypatch, stream, fixture):
         original = copy.deepcopy(messages)
         response = model(messages, TOOLS, request_context=context)
         assert messages == original
+        assert len(response["tool_calls"]) == 1
+        if continuation:
+            prefix = "OFFLINE_CONTINUATION_PREFIX: unfinished response; "
+            assert response["content"].startswith(prefix)
+            assert response["content"].count(prefix) == 1
+            assert response["content"].count("Before the tool.") == 1
+            assert response["content"].count("After the tool.") == 1
+        assert response["_usage"]["output_tokens"] == (6 if continuation else 3)
+        assert response["_usage"]["cache_read_input_tokens"] == 11
+        assert response["_usage"]["prompt_tokens"] == 18
         call = response["tool_calls"][0]
         assert call["id"] == "tool_fixture"
         assert call["function"]["name"] == "probe_add"
         args = json.loads(call["function"]["arguments"])
+        assert args == {"a": 2, "b": 3}
         result = args["a"] + args["b"]  # Only the host performs the tool action.
         messages += [response, {"role": "tool", "tool_call_id": call["id"], "content": str(result)}]
         final = model(messages, TOOLS, request_context=context)

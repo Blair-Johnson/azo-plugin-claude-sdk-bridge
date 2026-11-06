@@ -8,6 +8,9 @@ import { offlineSdk } from './local-api.mjs';
 // This fixture never computes a tool result: only the Python host computes 2 + 3.
 const key = process.env.AZO_CLAUDE_BRIDGE_KEY;
 assert.ok(typeof key === 'string' && key.length >= 32, 'Python must supply a synthetic bridge key');
+const continuation = process.env.AZO_SDK_FIXTURE_CONTINUATION === '1';
+const PREFIX = 'OFFLINE_CONTINUATION_PREFIX: unfinished response; ';
+const USAGE = { input_tokens: 7, output_tokens: 3, cache_read_input_tokens: 11, cache_creation_input_tokens: 0 };
 const cleanup = [];
 const SCHEMA = {
   type: 'object', properties: { a: { type: 'integer' }, b: { type: 'integer' } }, required: ['a', 'b'],
@@ -24,22 +27,34 @@ const runtime = await offlineSdk({ after(fn) { cleanup.push(fn); } }, (body, ind
   const blocks = body.messages.flatMap(message => Array.isArray(message.content) ? message.content : []);
   const uses = blocks.filter(block => block.type === 'tool_use');
   const results = blocks.filter(block => block.type === 'tool_result');
-  if (index === 0) {
+  if (index <= Number(continuation)) {
     assert.equal(hostCalls, 1);
     assert.deepEqual(uses, []);
     assert.deepEqual(results, []);
     assert.ok(JSON.stringify(body.messages).includes('Use probe_add for 2 + 3.'));
+    if (continuation && index === 0) {
+      return { content: [{ type: 'text', text: PREFIX }], stop_reason: 'max_tokens', usage: USAGE };
+    }
+    if (continuation) {
+      const previous = body.messages.findIndex(message => message.role === 'assistant' && textOf(message.content) === PREFIX);
+      assert.ok(previous >= 0, 'SDK continuation must retain the truncated assistant response');
+      assert.ok(body.messages.slice(previous + 1).some(message => message.role === 'user' && textOf(message.content).trim()),
+        'SDK must append a nonempty continuation prompt');
+    }
     return [
       { type: 'text', text: 'Before the tool.' },
       { type: 'tool_use', id: 'tool_fixture', name: NAME, input: { a: 2, b: 3 } },
       { type: 'text', text: 'After the tool.' },
     ];
   }
-  assert.equal(index, 1, 'Only two synthetic model calls are expected');
+  assert.equal(index, 1 + Number(continuation), 'Only the initial segment(s) and tool-result model call are expected');
   assert.equal(hostCalls, 2);
   // The pinned SDK groups text before tool calls in its own provider replay.
   // Exact host ordering is checked separately before realManager.handle below.
-  assert.deepEqual(body.messages.find(message => message.role === 'assistant').content.map(({ cache_control, ...block }) => block), [
+  const toolAssistant = body.messages.find(message => message.role === 'assistant'
+    && Array.isArray(message.content) && message.content.some(block => block.type === 'tool_use'));
+  assert.ok(toolAssistant, 'SDK replay must contain the assistant tool batch');
+  assert.deepEqual(toolAssistant.content.map(({ cache_control, ...block }) => block), [
     { type: 'text', text: 'Before the tool.' },
     { type: 'text', text: 'After the tool.' },
     { type: 'tool_use', id: 'tool_fixture', name: NAME, input: { a: 2, b: 3 } },
@@ -52,7 +67,7 @@ const runtime = await offlineSdk({ after(fn) { cleanup.push(fn); } }, (body, ind
   assert.equal(textOf(results[0].content), '5', 'Only the actual Python host result may satisfy MCP');
   assert.equal(results[0].is_error ?? false, false);
   return [{ type: 'text', text: 'HOST_RESULT_5' }];
-}, { usage: { input_tokens: 7, output_tokens: 3, cache_read_input_tokens: 11, cache_creation_input_tokens: 0 } });
+}, { usage: USAGE });
 const realManager = runtime.makeManager();
 const manager = {
   async handle(body, context) {
@@ -73,6 +88,9 @@ const manager = {
       const message = await realManager.handle(body, context);
       if (turn === 1) {
         assert.deepEqual(runtime.settled, []);
+        assert.equal(message.usage.output_tokens, continuation ? 6 : 3);
+        assert.equal(message.usage.input_tokens, 7);
+        assert.equal(message.usage.cache_read_input_tokens, 11);
       } else {
         assert.equal(runtime.queries.length, 1, 'Exact replay must reuse the existing SDK query');
         assert.equal(runtime.callbacks.length, 1, 'Historical tools must not execute again');

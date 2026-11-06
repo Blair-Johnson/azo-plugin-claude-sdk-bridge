@@ -65,6 +65,47 @@ function providerFailure(reason, sdk, session) {
   return failure;
 }
 const clone = value => structuredClone(value);
+
+function streamFailure(reason, request, nextId, session) {
+  const stream = request.stream;
+  return upstream(reason, {
+    previous_message_id: stream?.message.id, next_message_id: nextId,
+    previous_stopped: stream?.stopped, previous_stop_reason: stream?.message.stop_reason,
+    previous_usage: stream?.message.usage,
+    previous_block_types: [...(stream?.blocks.values() ?? [])].map(entry => entry.block.type),
+    api_retry: session.lastRetry,
+  });
+}
+
+// One native response can span multiple SDK max_tokens segments. Prompt/cache
+// counters describe the LAST request (context size), not aggregate billing;
+// output counters include all retained segments. Never sum cumulative deltas.
+function continuationMessage(request, source) {
+  const prefix = request.continuation;
+  if (!prefix) return source;
+  const usage = { ...source.usage,
+    cache_creation_input_tokens: source.usage?.cache_creation_input_tokens ?? 0,
+    cache_read_input_tokens: source.usage?.cache_read_input_tokens ?? 0,
+    output_tokens: prefix.outputTokens + (source.usage?.output_tokens ?? 0) };
+  const details = { ...source.usage?.output_tokens_details };
+  for (const [key, value] of Object.entries(prefix.outputDetails)) details[key] = value + (details[key] ?? 0);
+  if (Object.keys(details).length) usage.output_tokens_details = details;
+  return { ...source, id: prefix.id, content: [...prefix.content, ...source.content], usage };
+}
+
+function retainContinuation(request) {
+  const stream = request.stream;
+  const prefix = request.continuation ??= {
+    id: stream.message.id, content: [], outputTokens: 0, outputDetails: {}, ids: new Set(), published: false,
+  };
+  prefix.content.push(...stream.message.content);
+  prefix.outputTokens += stream.message.usage?.output_tokens ?? 0;
+  for (const [key, value] of Object.entries(stream.message.usage?.output_tokens_details ?? {})) {
+    if (typeof value === 'number') prefix.outputDetails[key] = (prefix.outputDetails[key] ?? 0) + value;
+  }
+  prefix.ids.add(stream.message.id);
+  prefix.published ||= stream.published;
+}
 function bridgeError(error, reason = 'internal_error') {
   if (error instanceof BridgeError) return error;
   const status = error?.statusCode;
@@ -511,6 +552,9 @@ export class BridgeManager {
       session.lastRetry = undefined;
       const request = slot.current;
       if (request && !request.settled) {
+        if (request.stream?.stopped && request.stream.message.stop_reason === 'max_tokens') {
+          throw streamFailure('output_limit_without_continuation', request, undefined, session);
+        }
         const message = request.complete ?? request.fallback;
         if (!message) throw upstream('result_without_message');
         if (!message.stop_reason) message.stop_reason = sdk.stop_reason ?? 'end_turn';
@@ -526,11 +570,13 @@ export class BridgeManager {
       if (session.emitted.has(sdk.message?.id)) return; // late per-block SDK echo
       if (sdk.uuid && request.sdkUuids.has(sdk.uuid)) return;
       if (sdk.uuid) request.sdkUuids.add(sdk.uuid);
-      // Same-ID envelopes echo streamed blocks. A different ID is a retry:
-      // discard only unpublished state, never splice two visible responses.
-      if (request.stream?.message.id === sdk.message?.id) return;
+      // Same-ID envelopes echo streamed blocks. Same-ID echoes from every retained
+      // segment may arrive late; none is a replacement of the logical response.
+      if (request.stream?.message.id === sdk.message?.id || request.continuation?.ids.has(sdk.message?.id)) return;
       if (request.stream) {
-        if (request.stream.published) throw upstream('published_message_replaced');
+        if (request.stream.published || request.continuation) {
+          throw streamFailure('published_message_replaced', request, sdk.message?.id, session);
+        }
         request.stream = null;
         request.complete = null;
       }
@@ -559,15 +605,28 @@ export class BridgeManager {
       return;
     }
     if (event.type === 'message_start') {
-      if (session.emitted.has(event.message.id)) { request.ignoredStream = true; return; }
-      if (request.stream?.published) throw upstream('published_stream_replaced');
-      request.complete = null;
+      const previous = request.stream;
+      if (session.emitted.has(event.message.id) || request.continuation?.ids.has(event.message.id)
+          || previous?.stopped && previous.message.id === event.message.id) {
+        request.ignoredStream = true;
+        return;
+      }
       const message = clone(event.message);
       if (message.content?.length) throw upstream('nonempty_message_start');
+      if (previous?.stopped && previous.message.stop_reason === 'max_tokens') {
+        if (message.model !== previous.message.model) {
+          throw streamFailure('continuation_model_changed', request, message.id, session);
+        }
+        retainContinuation(request);
+      } else if (previous?.published || request.continuation) {
+        throw streamFailure('published_stream_replaced', request, message.id, session);
+      }
+      request.complete = null;
       message.content = [];
       event.message = clone(message);
       request.fallback = null;
-      request.stream = { message, events: [event], blocks: new Map(), stopped: false, published: false };
+      request.stream = { message, events: request.continuation ? previous.events : [event], blocks: new Map(), stopped: false,
+        published: request.continuation?.published ?? false, offset: request.continuation?.content.length ?? 0 };
       return;
     }
     const stream = request.stream;
@@ -595,16 +654,35 @@ export class BridgeManager {
     } else if (event.type === 'message_delta') {
       Object.assign(stream.message, event.delta);
       stream.message.usage = { ...stream.message.usage, ...event.usage };
+      // This may be an intermediate max_tokens boundary. Only publish terminal
+      // metadata after the segment is validated and known to be the final one.
+      stream.delta = { ...event, delta: { ...stream.delta?.delta, ...event.delta } };
+      return;
     } else if (event.type === 'message_stop') {
       const entries = [...stream.blocks.entries()].sort(([a], [b]) => a - b);
       if (entries.some(([index, entry], i) => index !== i || !entry.closed)) throw upstream('incomplete_stream_blocks');
       stream.message.content = entries.map(([, entry]) => entry.block);
       stream.stopped = true;
-      request.complete = stream.message;
+      if (stream.message.stop_reason === 'max_tokens') {
+        // The SDK may already be waiting on these calls: never dispatch a
+        // truncated batch, or wait indefinitely for a continuation it cannot send.
+        if (stream.message.content.some(block => block.type === 'tool_use')) {
+          throw streamFailure('max_tokens_tool_batch_incomplete', request, undefined, session);
+        }
+        if (stream.message.content.some(block => block.type === 'thinking' && !block.signature)) {
+          throw streamFailure('max_tokens_thinking_incomplete', request, undefined, session);
+        }
+        request.complete = null;
+        return;
+      }
+      request.complete = continuationMessage(request, stream.message);
+      if (stream.delta) stream.events.push({ ...stream.delta, usage: clone(request.complete.usage) });
     } else throw upstream('unsupported_event');
+    // Validate local SDK indexes above; only transport indexes are offset.
+    if ('index' in event) event.index += stream.offset;
     stream.events.push(event);
     if (stream.stopped && stream.message.stop_reason === 'tool_use') {
-      this.finish(slot, session, request, stream.message, stream.events);
+      this.finish(slot, session, request, request.complete, stream.events);
     } else if (!stream.stopped) {
       this.publish(slot, request, stream.events.splice(0));
       stream.published ||= Boolean(request.onEvent);
@@ -633,8 +711,10 @@ export class BridgeManager {
       session.ready = false;
     }
     session.expected = canonicalMessages([...request.messages, { role: 'assistant', content: message.content }]);
-    session.emitted.add(message.id);
-    if (session.emitted.size > 512) session.emitted.delete(session.emitted.values().next().value);
+    for (const id of [message.id, ...(request.continuation?.ids ?? []), request.stream?.message.id].filter(Boolean)) {
+      session.emitted.add(id);
+      if (session.emitted.size > 512) session.emitted.delete(session.emitted.values().next().value);
+    }
     // Progress already flowed; expect(fullBatch) MUST precede message_stop,
     // the boundary at which the host collector may execute the tools.
     const events = rawEvents ?? messageEvents(message);

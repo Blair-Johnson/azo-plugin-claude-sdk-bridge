@@ -4,6 +4,7 @@ import { mkdtemp, rm, writeFile, access, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { MessageStream } from '@anthropic-ai/sdk/lib/MessageStream';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { BridgeManager } from '../src/engine.mjs';
@@ -1128,3 +1129,172 @@ test('cancellation during workspace allocation cleans the late-created directory
   await assert.rejects(access(slot.cwd), { code: 'ENOENT' });
   assert.equal(f.queries.length, 0);
 });
+
+for (const streaming of [true, false]) {
+  test(`max_tokens continuations form one complete response (streaming=${streaming})`, async t => {
+    const content = [{ type: 'thinking', thinking: 'first reasoning', signature: 'signature-one' },
+      { type: 'text', text: 'first part' }, { type: 'text', text: 'second part' },
+      { type: 'thinking', thinking: 'last reasoning', signature: 'signature-two' },
+      { type: 'text', text: 'last part' }];
+    const f = await fixture(t, q => {
+      if (q.prompts.length > 1) { q.respond([{ type: 'text', text: 'followup' }]); return; }
+      q.respond(content.slice(0, 2), { id: 'segment-one', stop: 'max_tokens', result: false });
+      q.respond(content.slice(2, 3), { id: 'segment-two', stop: 'max_tokens', result: false });
+      q.respond(content.slice(3), { id: 'segment-three' });
+    });
+    const events = [], input = body();
+    const answer = await f.manager.handle(input, { sessionId: 's',
+      ...(streaming ? { onEvent: event => events.push(event) } : {}) });
+    assert.equal(answer.id, 'segment-one');
+    assert.equal(answer.stop_reason, 'end_turn');
+    assert.deepEqual(answer.content, content);
+    assert.equal(answer.usage.output_tokens, 27);
+    assert.equal(answer.usage.input_tokens, 12, 'Prompt size describes the latest SDK segment');
+    assert.deepEqual(f.manager.sessions.get('s').session.expected,
+      canonicalMessages([...input.messages, { role: 'assistant', content }]));
+    if (streaming) {
+      assert.equal(events.filter(e => e.type === 'message_start').length, 1);
+      assert.equal(events.filter(e => e.type === 'message_stop').length, 1);
+      assert.deepEqual(events.filter(e => e.type === 'content_block_start').map(e => e.index), [0, 1, 2, 3, 4]);
+      assert.deepEqual(events.filter(e => e.type === 'message_delta').map(e => e.delta.stop_reason), ['end_turn']);
+      assert.equal(events.find(e => e.type === 'message_delta').usage.output_tokens, 27);
+    }
+    const followup = await f.manager.handle(next(input, answer, 'next user'), { sessionId: 's' });
+    assert.equal(followup.content[0].text, 'followup');
+    assert.equal(f.queries.length, 1, 'Normalization must preserve live session reuse');
+  });
+}
+
+test('max_tokens continuation commits only the final complete tool batch', async t => {
+  const f = await fixture(t, q => {
+    q.respond([{ type: 'text', text: 'planning' }], { id: 'planning', stop: 'max_tokens', result: false });
+    q.respond([use('a'), use('b')], { id: 'tools', stop: 'tool_use' });
+  });
+  const input = body(), events = [];
+  const first = await f.manager.handle(input, { sessionId: 's', onEvent(event) {
+    if (event.type === 'message_stop') assert.deepEqual([...f.manager.sessions.get('s').session.tools.pendingIds], ['a', 'b']);
+    events.push(event);
+  } });
+  assert.deepEqual(first.content, [{ type: 'text', text: 'planning' }, use('a'), use('b')]);
+  assert.equal(first.stop_reason, 'tool_use');
+  assert.equal(events.filter(e => e.type === 'message_stop').length, 1);
+  const pending = f.manager.handle(next(input, first, [result('a', 'A'), result('b', 'B')]), { sessionId: 's' });
+  await until(() => f.manager.sessions.get('s').session.tools.pendingIds.size === 0);
+  const q = f.queries[0];
+  assert.equal((await q.call('a')).content[0].text, 'A');
+  assert.equal((await q.call('b')).content[0].text, 'B');
+  // Late echoes of every segment must remain ignored after logical completion.
+  q.respond([{ type: 'text', text: 'stale planning' }], { id: 'planning', echo: false, result: false });
+  q.respond([use('a'), use('b')], { id: 'tools', stop: 'tool_use', echo: false });
+  q.respond([{ type: 'text', text: 'done' }]);
+  assert.equal((await pending).content[0].text, 'done');
+  assert.equal(f.queries.length, 1);
+});
+
+for (const scenario of ['tool-prefix', 'unsigned-thinking', 'unfinished-replacement', 'non-max-stop', 'no-continuation', 'changed-model']) {
+  test(`max_tokens continuation rejects unsafe case: ${scenario}`, async t => {
+    const f = await fixture(t, q => {
+      if (scenario === 'tool-prefix') {
+        q.respond([use('must-not-run')], { stop: 'max_tokens', result: false });
+      } else if (scenario === 'unsigned-thinking') {
+        q.respond([{ type: 'thinking', thinking: 'unfinished', signature: '' }], { stop: 'max_tokens', result: false });
+      } else if (scenario === 'non-max-stop') {
+        q.respond([{ type: 'text', text: 'completed' }], { stop: 'end_turn', result: false });
+      } else {
+        q.respond([{ type: 'text', text: 'prefix' }], { stop: 'max_tokens', result: false });
+      }
+      if (scenario === 'no-continuation') { q.result(); return; }
+      if (scenario === 'unfinished-replacement') {
+        startMessage(q, 'unfinished');
+        q.emit({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+      }
+      if (scenario === 'changed-model') {
+        q.emit({ type: 'message_start', message: { id: 'changed', model: 'different-model', content: [] } });
+        return;
+      }
+      q.respond([{ type: 'text', text: 'must not commit' }]);
+    });
+    const events = [];
+    await assert.rejects(f.manager.handle(body(), { sessionId: 's', onEvent: event => events.push(event) }), error => {
+      const reasons = { 'tool-prefix': 'max_tokens_tool_batch_incomplete', 'unsigned-thinking': 'max_tokens_thinking_incomplete',
+        'unfinished-replacement': 'published_stream_replaced', 'non-max-stop': 'published_stream_replaced',
+        'no-continuation': 'output_limit_without_continuation', 'changed-model': 'continuation_model_changed' };
+      assert.ok(error.message.includes(reasons[scenario]), error.message);
+      assert.ok(error.message.includes('previous_stop_reason'));
+      return true;
+    });
+    assert.equal(events.some(event => event.type === 'message_stop'), false);
+    assert.equal(f.manager.sessions.get('s').session.tools.pendingIds.size, 0);
+    assert.equal(f.queries[0].closed, 1);
+  });
+}
+
+test('max_tokens continuation preserves live progress and latest prompt usage without stale counters', async t => {
+  const events = [];
+  const f = await fixture(t, async q => {
+    q.emit({ type: 'message_start', message: { id: 'first', type: 'message', role: 'assistant', model: 'claude-test',
+      content: [], stop_reason: null, usage: { input_tokens: 10, output_tokens: 0,
+        cache_read_input_tokens: 20, cache_creation_input_tokens: 30 } } });
+    q.emit({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+    q.emit({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'early' } });
+    q.emit({ type: 'content_block_stop', index: 0 });
+    q.emit({ type: 'message_delta', delta: { stop_reason: 'max_tokens' },
+      usage: { input_tokens: 10, cache_read_input_tokens: 20, output_tokens: 8, output_tokens_details: { thinking_tokens: 3 } } });
+    q.emit({ type: 'message_stop' });
+    await until(() => events.some(e => e.delta?.text === 'early'));
+    assert.equal(events.some(e => e.type === 'message_stop'), false);
+    startMessage(q, 'second');
+    q.emit({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+    q.emit({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'later' } });
+    q.emit({ type: 'content_block_stop', index: 0 });
+    q.emit({ type: 'message_delta', delta: {}, usage: { output_tokens: 2 } });
+    q.emit({ type: 'message_delta', delta: { stop_reason: 'end_turn' },
+      usage: { input_tokens: 47, output_tokens: 5, output_tokens_details: { thinking_tokens: 2 } } });
+    q.emit({ type: 'message_stop' });
+    q.result();
+  });
+  const answer = await f.manager.handle(body(), { sessionId: 's', onEvent: event => events.push(event) });
+  assert.equal(answer.usage.output_tokens, 13, 'Cumulative updates must not be double counted');
+  assert.equal(answer.usage.output_tokens_details.thinking_tokens, 5);
+  assert.equal(answer.usage.input_tokens, 47);
+  assert.equal(answer.usage.cache_read_input_tokens, 0, 'Clear prior segment cache counters');
+  assert.equal(answer.usage.cache_creation_input_tokens, 0);
+  const client = MessageStream.fromReadableStream(new ReadableStream({ start(controller) {
+    for (const event of events) controller.enqueue(new TextEncoder().encode(`${JSON.stringify(event)}\n`));
+    controller.close();
+  } }));
+  assert.deepEqual((await client.finalMessage()).usage, answer.usage);
+  assert.deepEqual(events.find(e => e.type === 'message_delta').usage, answer.usage);
+  assert.equal(events.filter(e => e.type === 'message_start').length, 1);
+  assert.equal(events.filter(e => e.type === 'message_stop').length, 1);
+});
+
+for (const streaming of [true, false]) {
+  test(`max_tokens continuation retains the opening event after empty segments (streaming=${streaming})`, async t => {
+    const f = await fixture(t, q => {
+      q.respond([], { id: 'empty-first', stop: 'max_tokens', result: false });
+      q.respond([], { id: 'empty-second', stop: 'max_tokens', result: false });
+      q.respond([{ type: 'text', text: 'complete' }], { id: 'nonempty-final' });
+    });
+    const events = [];
+    const answer = await f.manager.handle(body(), { sessionId: 's',
+      ...(streaming ? { onEvent: event => events.push(event) } : {}) });
+    assert.equal(answer.id, 'empty-first');
+    assert.deepEqual(answer.content, [{ type: 'text', text: 'complete' }]);
+    assert.equal(answer.usage.output_tokens, 27);
+    if (streaming) {
+      assert.equal(events[0].type, 'message_start');
+      assert.equal(events[0].message.id, 'empty-first');
+      assert.equal(events.filter(e => e.type === 'message_start').length, 1);
+      assert.equal(events.filter(e => e.type === 'message_stop').length, 1);
+      const client = MessageStream.fromReadableStream(new ReadableStream({ start(controller) {
+        for (const event of events) controller.enqueue(new TextEncoder().encode(`${JSON.stringify(event)}\n`));
+        controller.close();
+      } }));
+      const collected = await client.finalMessage();
+      assert.equal(collected.id, answer.id);
+      assert.deepEqual(collected.content, answer.content);
+      assert.deepEqual(collected.usage, answer.usage);
+    }
+  });
+}

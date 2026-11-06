@@ -10,7 +10,7 @@ import { QueryProcess } from '../../src/child.mjs';
 
 export const SYNTHETIC_KEY = 'synthetic-offline-key';
 
-function streamMessage(response, body, content, index, usage) {
+function streamMessage(response, body, content, index, usage, stopReason) {
   response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
   const emit = (type, data) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
   emit('message_start', { message: {
@@ -35,7 +35,7 @@ function streamMessage(response, body, content, index, usage) {
     emit('content_block_stop', { index: blockIndex });
   });
   emit('message_delta', {
-    delta: { stop_reason: content.some(block => block.type === 'tool_use') ? 'tool_use' : 'end_turn', stop_sequence: null },
+    delta: { stop_reason: stopReason, stop_sequence: null },
     usage: { output_tokens: usage.output_tokens },
   });
   emit('message_stop', {});
@@ -76,8 +76,12 @@ export async function localApi(t, reply, { usage = {
       assert.equal(pathname, '/v1/messages');
       assert.equal(body.stream, true, 'Fixture expects the real SDK streaming protocol');
       requests.push(body);
-      const content = await reply(body, requests.length - 1);
-      streamMessage(response, body, content, requests.length, usage);
+      // Arrays retain the original contract; object replies can model truncated
+      // segments and distinct per-response usage without replacing the real SDK.
+      const result = await reply(body, requests.length - 1);
+      const { content, stop_reason, usage: replyUsage } = Array.isArray(result) ? { content: result } : result;
+      streamMessage(response, body, content, requests.length, { ...usage, ...replyUsage },
+        stop_reason ?? (content.some(block => block.type === 'tool_use') ? 'tool_use' : 'end_turn'));
     } catch (error) {
       failures.push(error);
       if (!response.headersSent) response.writeHead(400, { 'content-type': 'application/json' });
