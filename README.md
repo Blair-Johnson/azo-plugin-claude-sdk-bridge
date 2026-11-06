@@ -1,4 +1,4 @@
-# Claude SDK bridge
+# azo-plugin-claude-sdk-bridge
 
 This optional local provider uses the Claude Agent SDK behind Agent Zoo's existing Anthropic Messages client. It adds no core hooks, changes no default model, and does not replace Agent Zoo's runtime. Agent Zoo still runs tools, applies its permission and pipeline logic, and owns the conversation history.
 
@@ -8,21 +8,21 @@ The design follows [pi-claude-bridge](https://github.com/elidickinson/pi-claude-
 
 Dependencies are isolated here. Nothing installs into Agent Zoo's root environment, modifies its bundled model catalog, or changes its default model. The lockfiles pin the same Agent SDK and transcript library versions used by the reference adapter.
 
-Install the runtime and common-scope plugin once, from this integration's source directory:
+Install the common-scope plugin from this standalone repository:
 
 ```sh
-cd /absolute/path/to/agent-zoo/integrations/claude-sdk-bridge
-pixi install
-pixi run install  # npm ci with the checked-in lockfile
-azo-plugin install "$PWD/plugin/claude_sdk_bridge.py" common
+azo-plugin install /absolute/path/to/azo-plugin-claude-sdk-bridge
 ```
 
-The plugin installation links the original source file; keep this checkout and its isolated dependencies available. Do not copy the plugin into a different directory: it locates the Node runtime and bridge files relative to its source. Use Claude Code's normal login. The bridge does not extract OAuth tokens, run its own login flow, enable extra usage, or change billing settings.
+Requires an Agent Zoo installer supporting `[tool.agent-zoo.plugin.workspace]`. The installer copies the repo into its managed `plugin-sources` directory, prepares its private Pixi environment, runs the manifest's `install` task (`npm ci` with the checked-in lockfile), and only then links the plugin into common scope. Node dependencies are not added to the host Python environment. Failed setup leaves the previous installation intact. Installation runs the repository's setup task as your user; install only trusted sources. Use the default linked installation, not `--copy`: the plugin resolves its sidecar and private Node runtime relative to its source. The original development checkout may be moved or removed after installation. Reinstall to update the managed copy, and restart the backend to switch its sidecar to the new installation.
 
-Add profiles to your existing `config/models.yaml` using Agent Zoo's Python environment. From the repository root:
+Use Claude Code's normal login. The bridge does not extract OAuth tokens, run its own login flow, enable extra usage, or change billing settings.
+
+Add profiles to your existing `config/models.yaml` using Agent Zoo's Python environment. From this repo (or the installed source directory):
 
 ```sh
-pixi run python integrations/claude-sdk-bridge/configure_local.py \
+export AZO_HOST_MANIFEST=/absolute/path/to/agent-zoo/pixi.toml
+pixi run --manifest-path "$AZO_HOST_MANIFEST" python "$PWD/configure_local.py" \
     --config /absolute/path/to/config/models.yaml \
     --model claude-sonnet-sdk-bridge=sonnet \
     --model claude-opus-sdk-bridge=opus
@@ -86,13 +86,14 @@ Run the isolated Node tests from this directory:
 pixi run test
 ```
 
-Run the real Agent Zoo client compatibility tests from the repository root with its normal Python environment:
+Prepare the development checkout once with `pixi run install`. Run the real Agent Zoo client, plugin lifecycle, setup, and runtime steering tests with a selected host's Python environment:
 
 ```sh
-pixi run python -m pytest -q \
-    integrations/claude-sdk-bridge/tests/test_configure_local.py \
-    integrations/claude-sdk-bridge/tests/test_agent_zoo_provider.py
+export AZO_HOST_MANIFEST=/absolute/path/to/agent-zoo/pixi.toml
+pixi run test-host
 ```
+
+The host environment must already be installed. Its editable Agent Zoo package supplies imports, including in subprocesses; no assumed sibling checkout or `PYTHONPATH` overlay is used. Node comes from this repo's private environment. These tests use synthetic loopback providers, not a live Claude account. Core contract coverage lives in Agent Zoo's native-provider and runtime lifecycle tests; this repo owns the end-to-end compatibility tests.
 
 The setup tests use temporary config files and synthetic keys. The provider test exercises the unchanged `make_llm_fn` in both streaming and JSON modes, first against a deterministic endpoint and then through the actual bridge, real SDK child, MCP callbacks, and loopback fake model API. Install this integration's dependencies before running it. Node tests exercise ID routing, schema fidelity, history import, session lifecycle, HTTP auth, errors, cancellation, and the real SDK against an isolated local fake model server. These are offline protocol tests, not live-account or plan-billing tests.
 

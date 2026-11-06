@@ -1,7 +1,7 @@
 """Offline contract test through the unchanged native Agent Zoo provider.
 
-Run from the repository root with its normal Python environment; NODE_BINARY may
-point to this integration's Pixi node. No Claude credentials or remote calls.
+Run via `pixi run test-host` with AZO_HOST_MANIFEST selecting Agent Zoo's Python
+environment. NODE_BINARY selects this plugin's Pixi node. No remote calls.
 """
 import copy
 import json

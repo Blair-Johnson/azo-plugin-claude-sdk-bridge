@@ -9,7 +9,10 @@ import json
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+# The read-only journal loader is a host diagnostic, not part of this plugin.
+# Resolve its checkout from the selected host interpreter, never sibling paths.
+import agent_zoo
+sys.path.insert(0, str(Path(agent_zoo.__file__).resolve().parents[1]))
 from scripts.diagnostics.large_session_projection_probe import load_readonly
 
 parser = argparse.ArgumentParser(description=__doc__)

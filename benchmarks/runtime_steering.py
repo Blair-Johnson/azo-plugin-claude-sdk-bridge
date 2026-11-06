@@ -35,9 +35,8 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-# Make the selected worktree authoritative, including in multiprocessing spawn.
-ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(ROOT))
+# Run with the selected Agent Zoo environment; its installed package also
+# supplies imports to multiprocessing workers, independently of this repo's path.
 
 from agents.llm_subprocess import LLMCancelledError, LLMProcessSupervisor
 

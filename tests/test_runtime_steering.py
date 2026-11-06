@@ -16,8 +16,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[3]
-BENCHMARK = ROOT / "integrations/claude-sdk-bridge/benchmarks/runtime_steering.py"
+ROOT = Path(__file__).resolve().parents[1]
+BENCHMARK = ROOT / "benchmarks/runtime_steering.py"
 STEERED = "AZO_RUNTIME_STEERED"
 STALE = "AZO_RUNTIME_STALE"
 KEY = "synthetic-runtime-steering-local-key-123456"
