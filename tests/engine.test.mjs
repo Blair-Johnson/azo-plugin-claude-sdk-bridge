@@ -723,9 +723,9 @@ function diagnostic(reason, phase = 'consume', rebuild = 'initial', action = 're
 function exceptionDiagnostic(error, reason, phase) {
   return `${errorText(error)} [reason=${reason}] [phase=${phase} action=rebuild rebuild=initial]`;
 }
-function reports(expected, cause) {
+function reports(expected, cause, status = 502) {
   return error => {
-    assert.equal(error.statusCode, 502);
+    assert.equal(error.statusCode, status);
     assert.equal(error.message, expected);
     assert.equal(error.publicMessage, expected, 'SSE receives the complete error details');
     assert.equal(error.cause, cause, 'the underlying error/envelope is retained');
@@ -754,8 +754,9 @@ test('SDK result and assistant errors preserve full envelopes including unknown 
       stderr: diagnosticText, session_id: diagnosticText, result: diagnosticText,
       message: { content: [{ type: 'text', text: diagnosticText }], details: { provider: diagnosticText } }, ...fields };
     const f = await fixture(t, q => q.raw(sdk));
+    const status = { authentication_failed: 401, rate_limit: 429 }[fields.error] ?? 502;
     await assert.rejects(f.manager.handle(body(), { sessionId: 's' }),
-      reports(diagnostic(reason, 'consume', 'initial', 'rebuild', '', sdk), sdk));
+      reports(diagnostic(reason, 'consume', 'initial', 'rebuild', '', sdk), sdk, status));
     assert.equal(f.queries[0].closed, 1);
   }
   const f = await fixture(t, q => q.raw({ type: 'result', subtype: 'success' }));
@@ -882,12 +883,45 @@ test('history, settings and mixed-result rebuild reasons survive failures withou
   }
 });
 
+test('usage limits surface the SDK text, plan limit, and reset time as a rate-limit error', async t => {
+  const resetsAt = 1793980800;
+  const notice = "You've hit your limit · resets 3pm (America/New_York)";
+  const f = await fixture(t, q => {
+    q.raw({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', rateLimitType: 'five_hour', resetsAt,
+      overageDisabledReason: 'out_of_credits' } });
+    q.raw({ type: 'assistant', error: 'rate_limit', parent_tool_use_id: null,
+      message: { id: 'synthetic', model: '<synthetic>', content: [{ type: 'text', text: notice }] } });
+    q.raw({ type: 'result', subtype: 'success', is_error: true, api_error_status: 429, result: notice });
+  });
+  await assert.rejects(f.manager.handle(body(), { sessionId: 's' }), error => {
+    assert.equal(error.statusCode, 429);
+    assert.equal(error.errorType, 'rate_limit_error');
+    assert.equal(error.providerMessage, `${notice} [sdk_error=rate_limit limit=five_hour `
+      + `resets_at=${new Date(resetsAt * 1000).toISOString()} overage=out_of_credits]`);
+    assert.match(error.message, /^The Claude SDK session failed\. \[reason=assistant_error\]/, 'diagnostics retained');
+    assert.match(error.message, /\[phase=consume action=rebuild rebuild=initial\]$/);
+    return true;
+  });
+});
+
+test('result-only provider failures use the reported API status and error strings', async t => {
+  const f = await fixture(t, q => q.raw({ type: 'result', subtype: 'error_during_execution', is_error: true,
+    api_error_status: 529, errors: ['API Error: 529 Overloaded', { structured: 'kept in diagnostics only' }] }));
+  await assert.rejects(f.manager.handle(body(), { sessionId: 's' }), error => {
+    assert.equal(error.statusCode, 529);
+    assert.equal(error.errorType, 'overloaded_error');
+    assert.equal(error.providerMessage, 'API Error: 529 Overloaded [api_status=529]');
+    assert.match(error.message, /kept in diagnostics only/);
+    return true;
+  });
+});
+
 test('ordinary followup failure reports reuse rather than claiming a rebuild', async t => {
   const sdk = { type: 'assistant', error: 'rate_limit', message: diagnosticText };
   const f = await fixture(t, q => q.prompts.length === 1 ? q.respond([{ type: 'text', text: 'done' }]) : q.raw(sdk));
   const input = body(), answer = await f.manager.handle(input, { sessionId: 's' });
   await assert.rejects(f.manager.handle(next(input, answer, 'next'), { sessionId: 's' }),
-    reports(diagnostic('assistant_error', 'consume', 'none', 'user', '', sdk), sdk));
+    reports(diagnostic('assistant_error', 'consume', 'none', 'user', '', sdk), sdk, 429));
   assert.equal(f.queries.length, 1);
   assert.equal(f.queries[0].prompts.length, 2);
 });

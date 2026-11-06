@@ -18,6 +18,52 @@ const bad = message => new BridgeError(400, message);
 const upstream = (reason = 'internal_error', detail) => new BridgeError(502,
   `The Claude SDK session failed. [reason=${reason}]${detail === undefined ? '' : `\n${errorText(detail)}`}`,
   detail === undefined ? undefined : { cause: detail });
+// SDK failure categories as native Messages errors, so hosts can tell a usage
+// limit or login problem from a transient server failure.
+const SDK_ERROR_STATUS = {
+  rate_limit: [429, 'rate_limit_error'], billing_error: [402, 'billing_error'],
+  authentication_failed: [401, 'authentication_error'], cloud_credential_error: [401, 'authentication_error'],
+  oauth_org_not_allowed: [403, 'permission_error'], account_on_hold: [403, 'permission_error'],
+  verification_required: [403, 'permission_error'], model_not_found: [404, 'not_found_error'],
+  invalid_request: [400, 'invalid_request_error'], max_output_tokens: [400, 'invalid_request_error'],
+  overloaded: [529, 'overloaded_error'], server_error: [500, 'api_error'],
+};
+const HTTP_ERROR_TYPES = { 400: 'invalid_request_error', 401: 'authentication_error', 402: 'billing_error',
+  403: 'permission_error', 404: 'not_found_error', 413: 'request_too_large', 429: 'rate_limit_error',
+  529: 'overloaded_error' };
+const sdkText = content => typeof content === 'string' ? content : Array.isArray(content)
+  ? content.filter(block => block?.type === 'text' && typeof block.text === 'string').map(block => block.text).join('\n') : '';
+const resetTime = seconds => Number.isFinite(seconds) && seconds > 0 ? new Date(seconds * 1000).toISOString() : undefined;
+
+/** The SDK's own user-facing failure text, first and unabridged, plus the plan
+ * limit and HTTP status it reported. Full envelopes remain in the diagnostics. */
+function providerFailure(reason, sdk, session) {
+  const failure = upstream(reason, sdk);
+  const kind = typeof sdk?.error === 'string' ? sdk.error : undefined;
+  const text = (sdk?.type === 'assistant' ? sdkText(sdk.message?.content)
+    : sdk?.is_error && typeof sdk.result === 'string' ? sdk.result
+    : (Array.isArray(sdk?.errors) ? sdk.errors.filter(item => typeof item === 'string').join('\n') : '')).trim();
+  const limit = session?.rateLimit?.status === 'rejected' ? session.rateLimit : undefined;
+  const httpStatus = Number.isInteger(sdk?.api_error_status) ? sdk.api_error_status : session?.lastRetry?.error_status;
+  const details = [
+    kind && `sdk_error=${kind}`,
+    Number.isInteger(httpStatus) && `api_status=${httpStatus}`,
+    limit && `limit=${limit.rateLimitType ?? 'unknown'}`,
+    resetTime(limit?.resetsAt) && `resets_at=${resetTime(limit.resetsAt)}`,
+    limit?.overageDisabledReason && `overage=${limit.overageDisabledReason}`,
+    limit?.errorCode && `limit_error=${limit.errorCode}`,
+  ].filter(Boolean);
+  if (!text && !details.length) return failure;
+  failure.providerMessage = (text || 'The Claude SDK reported a provider failure.')
+    + (details.length ? ` [${details.join(' ')}]` : '');
+  const [status, type] = SDK_ERROR_STATUS[kind] ?? (limit ? [429, 'rate_limit_error']
+    : Number.isInteger(httpStatus) && httpStatus >= 400 && httpStatus < 600
+      ? [httpStatus, HTTP_ERROR_TYPES[httpStatus] ?? (httpStatus >= 500 ? 'api_error' : 'invalid_request_error')]
+      : [502, 'api_error']);
+  failure.statusCode = status;
+  failure.errorType = type;
+  return failure;
+}
 const clone = value => structuredClone(value);
 function bridgeError(error, reason = 'internal_error') {
   if (error instanceof BridgeError) return error;
@@ -445,6 +491,10 @@ export class BridgeManager {
   consume(slot, session, sdk) {
     if (sdk.parent_tool_use_id != null) throw upstream('unexpected_subagent'); // subagents are never enabled
     if (sdk.type === 'system' && sdk.subtype === 'compact_boundary') throw upstream('unexpected_compaction');
+    // Context for a later failure: which plan limit rejected us, and the
+    // provider status behind SDK-internal retries.
+    if (sdk.type === 'rate_limit_event') { session.rateLimit = sdk.rate_limit_info; return; }
+    if (sdk.type === 'system' && sdk.subtype === 'api_retry') { session.lastRetry = sdk; return; }
     const hasTool = sdk.type === 'assistant' && !session.emitted.has(sdk.message?.id)
       && sdk.message?.content?.some(block => block.type === 'tool_use')
       || sdk.type === 'stream_event' && sdk.event?.type === 'content_block_start' && sdk.event.content_block?.type === 'tool_use';
@@ -456,8 +506,9 @@ export class BridgeManager {
     }
     if (sdk.type === 'assistant' && sdk.aborted) throw upstream('assistant_aborted', sdk);
     if (sdk.type === 'result') {
-      if (sdk.subtype !== 'success' || sdk.is_error) throw upstream('result_error', sdk);
+      if (sdk.subtype !== 'success' || sdk.is_error) throw providerFailure('result_error', sdk, session);
       session.ready = true;
+      session.lastRetry = undefined;
       const request = slot.current;
       if (request && !request.settled) {
         const message = request.complete ?? request.fallback;
@@ -470,8 +521,8 @@ export class BridgeManager {
     const request = slot.current;
     if (!request || request.settled) return;
     if (sdk.type === 'assistant') {
-      if (sdk.error) throw upstream('assistant_error', sdk);
-      if (sdk.message?.model === '<synthetic>') throw upstream('synthetic_assistant', sdk);
+      if (sdk.error) throw providerFailure('assistant_error', sdk, session);
+      if (sdk.message?.model === '<synthetic>') throw providerFailure('synthetic_assistant', sdk, session);
       if (session.emitted.has(sdk.message?.id)) return; // late per-block SDK echo
       if (sdk.uuid && request.sdkUuids.has(sdk.uuid)) return;
       if (sdk.uuid) request.sdkUuids.add(sdk.uuid);
@@ -651,7 +702,7 @@ export class BridgeManager {
     if (request.settled) return;
     request.settled = true;
     const failure = bridgeError(error);
-    if (failure.statusCode >= 500) {
+    if (failure.statusCode >= 500 || failure.providerMessage !== undefined) {
       // Snapshot before disposal; neither an old closing process nor sink failure
       // should acquire unrelated process/shutdown diagnostics.
       const process = !slot.session?.cleanupPromise && !['dispose', 'publish'].includes(phase)

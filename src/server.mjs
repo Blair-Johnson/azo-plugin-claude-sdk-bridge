@@ -9,10 +9,15 @@ const loopback = address => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(ad
 function errorBody(error) {
   const status = Number.isInteger(error?.statusCode) && error.statusCode >= 400 && error.statusCode < 600
     ? error.statusCode : 502;
-  const type = status === 429 ? 'rate_limit_error' : status === 401 ? 'authentication_error' :
-    status >= 500 ? 'api_error' : 'invalid_request_error';
-  return { status, body: { type: 'error', error: { type,
-    message: errorText(error) } } };
+  const type = typeof error?.errorType === 'string' ? error.errorType
+    : status === 429 ? 'rate_limit_error' : status === 401 ? 'authentication_error' :
+      status >= 500 ? 'api_error' : 'invalid_request_error';
+  // Hosts usually show only the start of a message: lead with the provider's
+  // actionable text (e.g. a usage-limit reset), then the full diagnostics.
+  const details = errorText(error);
+  const message = typeof error?.providerMessage === 'string' && error.providerMessage
+    ? `${error.providerMessage}\n\n${details}` : details;
+  return { status, body: { type: 'error', error: { type, message } } };
 }
 
 function json(res, status, body) {

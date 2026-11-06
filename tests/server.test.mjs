@@ -122,6 +122,24 @@ test('stream failure preserves the actual error and cause in its terminal event'
   assert.match(failure.message, /provider body detail/);
 });
 
+test('provider failures lead with the SDK text and keep their type in SSE and JSON responses', async t => {
+  const provider = "You've hit your limit · resets 3pm [sdk_error=rate_limit limit=five_hour]";
+  const error = Object.assign(new Error('The Claude SDK session failed. [reason=assistant_error]'),
+    { statusCode: 429, errorType: 'rate_limit_error', providerMessage: provider });
+  const { send } = await fixture(t, { async handle() { throw error; } });
+  const text = await (await send({ ...body, stream: true })).text();
+  const event = text.split('\n').find(line => line.startsWith('data: ') && line.includes('"type":"error"'));
+  const streamed = JSON.parse(event.slice(6)).error;
+  assert.equal(streamed.type, 'rate_limit_error');
+  assert.ok(streamed.message.startsWith(`${provider}\n\n`), streamed.message);
+  assert.ok(streamed.message.includes(error.stack.split('\n')[0]), 'full diagnostics follow the provider text');
+  const response = await send();
+  assert.equal(response.status, 429);
+  const json = (await response.json()).error;
+  assert.equal(json.type, 'rate_limit_error');
+  assert.ok(json.message.startsWith(`${provider}\n\n`));
+});
+
 test('timeout aborts manager and terminates response even if manager ignores signal', async t => {
   let signal;
   const { send } = await fixture(t, { handle(_, context) {
