@@ -122,8 +122,11 @@ async function firstText(response, text) {
   return reader;
 }
 
+// The next three tests characterize --interrupt-mode reuse (SDK-private partials).
+const REUSE = { interruptMode: 'reuse' };
+
 test('offline real SDK: canceled HTTP + new user reuses PID/query and isolates old events', { timeout: 45_000 }, async t => {
-  const f = await setup(t);
+  const f = await setup(t, { managerOptions: REUSE });
   const endpoint = createBridgeServer({ manager: f.manager, key: KEY });
   const address = await endpoint.listen(0);
   t.after(() => endpoint.close());
@@ -163,7 +166,7 @@ test('offline real SDK: canceled HTTP + new user reuses PID/query and isolates o
 });
 
 test('offline real SDK: repeated feedback and normal continuation retain only SDK-side partials', { timeout: 45_000 }, async t => {
-  const f = await setup(t, { hold: [1, 3], reply: (_body, index) => [{ type: 'text', text:
+  const f = await setup(t, { hold: [1, 3], managerOptions: REUSE, reply: (_body, index) => [{ type: 'text', text:
     [PARTIAL, ANSWER, 'SYNTHETIC_SECOND_PARTIAL', 'SYNTHETIC_SECOND_ANSWER', 'SYNTHETIC_FINAL_ANSWER'][index] }] });
   const history = [user(FIRST)];
   const first = await start(f, history);
@@ -204,7 +207,7 @@ test('offline real SDK: repeated feedback and normal continuation retain only SD
 
 test('offline real SDK: 499 is immediate, but replacement waits for both interrupt receipt and old result', { timeout: 45_000 }, async t => {
   const receiptGate = deferred(), resultGate = deferred();
-  const f = await setup(t, { receiptGate, resultGate, managerOptions: { interruptTimeoutMs: 2000 } });
+  const f = await setup(t, { receiptGate, resultGate, managerOptions: { ...REUSE, interruptTimeoutMs: 2000 } });
   const first = await start(f);
   first.controller.abort();
   await assert.rejects(first.pending, { statusCode: 499 });

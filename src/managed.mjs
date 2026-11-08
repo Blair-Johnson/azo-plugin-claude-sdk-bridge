@@ -77,7 +77,7 @@ function validate(frame) {
       || typeof frame.key !== 'string' || !/^[a-f0-9]{64}$/i.test(frame.key)
       || ('ownedProcessGroup' in frame && typeof frame.ownedProcessGroup !== 'boolean')
       || ('systemPromptMode' in frame && !['append', 'custom'].includes(frame.systemPromptMode))
-      || ('interruptMode' in frame && !['reuse', 'rebuild'].includes(frame.interruptMode))) {
+      || ('interruptMode' in frame && !['rollback', 'reuse', 'rebuild'].includes(frame.interruptMode))) {
     throw new Error('Invalid control frame');
   }
   return frame;

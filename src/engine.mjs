@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { readFile, rm } from 'node:fs/promises';
 import { createWorkspace } from './workspace.mjs';
 import { ToolBridge } from './tools.mjs';
-import { canonicalMessages, digest, importSession, requestFingerprint, validateHistory } from './history.mjs';
+import { canonicalMessages, digest, importSession, isSessionId, requestFingerprint, transcriptPath, validateHistory } from './history.mjs';
+import { rollbackPoint } from './rollback.mjs';
 import { childEnvironment, isolatedSettings, QueryProcess } from './child.mjs';
 import { errorText } from './errors.mjs';
 
@@ -142,11 +143,12 @@ function promptStream() {
   const queue = [];
   let ended = false, wake;
   return {
-    push(content) {
+    push(content, uuid = randomUUID()) {
       if (ended) throw upstream('prompt_stream_closed');
       // Host messages are already composed: never expand mentions/commands or
-      // attach CLI-local reminders to them.
-      queue.push({ type: 'user', message: { role: 'user', content: clone(content) }, parent_tool_use_id: null, client_composed: true });
+      // attach CLI-local reminders to them. The UUID names the transcript record.
+      queue.push({ type: 'user', message: { role: 'user', content: clone(content) }, parent_tool_use_id: null,
+        client_composed: true, uuid });
       wake?.();
       wake = undefined;
     },
@@ -227,13 +229,18 @@ function foldTrailingContent(content, resultCount) {
   last.content = [...(last.content ?? []), ...clone(trailing)];
   return results;
 }
+// rollback: resume the SDK's own transcript just before the interrupted answer,
+// so SDK and host histories agree and the cached request prefix is unchanged.
+// reuse: keep the live process, which retains the SDK-private partial answer.
+// rebuild: re-import host history, which relocates startup reminders (cache miss).
+export const INTERRUPT_MODES = ['rollback', 'reuse', 'rebuild'];
 /** Agent Zoo owns history and tools. SDK sessions are disposable mirrors only. */
 export class BridgeManager {
   constructor({ queryFactory, stateRoot, idleMs = 300000,
     requestTimeoutMs = 0, maxSessions = 16, historyImporter = importSession,
     processFactory = () => new QueryProcess(), env = process.env, systemPromptMode = 'append',
-    interruptMode = 'reuse', interruptTimeoutMs = 500 } = {}) {
-    if (!['reuse', 'rebuild'].includes(interruptMode)) throw new TypeError('Invalid interrupt mode');
+    interruptMode = 'rollback', interruptTimeoutMs = 500 } = {}) {
+    if (!INTERRUPT_MODES.includes(interruptMode)) throw new TypeError('Invalid interrupt mode');
     if (!Number.isFinite(interruptTimeoutMs) || interruptTimeoutMs <= 0 || interruptTimeoutMs > 5000)
       throw new TypeError('Invalid interrupt timeout');
     this.interruptMode = interruptMode;
@@ -381,24 +388,47 @@ export class BridgeManager {
         request.reusing = false;
         return this.drive(slot, request, body, fingerprint, { kind: 'rebuild', reason: 'interrupt_not_reusable' });
       }
+      const { messageIds, turnPrompt } = session.interruption;
       session.interruption = null;
+      if (this.interruptMode === 'rollback') {
+        request.reusing = false;
+        return this.drive(slot, request, body, fingerprint, { kind: 'rebuild', reason: 'interrupt_rollback',
+          rollback: { content: plan.content, messageIds, turnPrompt } });
+      }
       session.ready = false;
       request.sent = true;
       request.phase = 'continuation';
-      session.prompts.push(plan.content);
+      session.prompts.push(plan.content, session.turnPrompt = randomUUID());
       request.phase = 'iterator';
       return;
     }
     if (plan.kind === 'rebuild') {
       request.phase = 'dispose';
-      await this.dispose(slot.session);
-      if (slot.session && (!slot.session.process.didExit || !slot.session.setupFinished))
-        throw new BridgeError(503, 'The previous SDK process is still closing.');
-      if (slot.session) await this.cleanupFiles(slot.session);
+      const previous = slot.session;
+      // A rollback resumes the previous mirror's own transcript: keep its files
+      // out of that process's cleanup, then hand them to the replacement.
+      const inherited = plan.rollback && previous ? previous.files : null;
+      if (inherited) previous.files = new Set();
+      try {
+        await this.dispose(previous);
+        if (previous && (!previous.process.didExit || !previous.setupFinished))
+          throw new BridgeError(503, 'The previous SDK process is still closing.');
+        if (previous) await this.cleanupFiles(previous);
+      } catch (error) {
+        // Still owned by a live process: its eventual exit cleanup removes them.
+        for (const path of inherited ?? []) previous.files.add(path);
+        throw error;
+      }
+      // Read only after exit, so the interrupted turn is fully flushed and no
+      // queued input can be appended behind the validated resume point.
+      const resume = inherited ? await this.rollbackTarget(previous, plan.rollback) : null;
+      if (plan.rollback) request.rebuildReason = resume ? 'interrupt_rollback' : 'rollback_unavailable';
+      if (inherited && (!resume || request.settled || this.closing || slot.closing)) await removeFiles(inherited);
       if (request.settled || this.closing || slot.closing) return;
       request.phase = 'setup';
       const session = { tools: new ToolBridge(body.tools ?? []), prompts: promptStream(), process: this.processFactory(),
         controller: new AbortController(), query: null, cwd: null, imported: null, expected: null, fingerprint,
+        files: new Set(resume ? inherited : []), sdkSessionId: null, turnPrompt: null,
         ready: false, dead: false, emitted: new Set(), cleanupPromise: null, pump: null, settingUp: true, setupFinished: false, setup: deferred() };
       slot.session = session;
       try {
@@ -408,7 +438,8 @@ export class BridgeManager {
         slot.cwd ??= await createWorkspace(this.stateRoot);
         session.cwd = slot.cwd;
         if (session.dead || request.settled) return;
-        const { prefix, prompt } = rebuildInput(request.messages);
+        // A resumed SDK transcript already holds the history; send only the feedback.
+        const { prefix, prompt } = resume ? { prefix: [], prompt: plan.rollback.content } : rebuildInput(request.messages);
         // Historical tools are names only: never advertise or execute them.
         const definitions = [...(body.tools ?? [])];
         const names = new Set(definitions.map(tool => tool.name));
@@ -426,6 +457,7 @@ export class BridgeManager {
           request.phase = 'history_import';
           session.imported = await this.historyImporter({ messages: prefix, cwd: session.cwd, model: body.model,
             toolNameToSdk: name => historyNames.get(name) });
+          if (session.imported?.path) session.files.add(session.imported.path);
         }
         if (session.dead || request.settled) return;
         // The CLI appends a synthetic "No response requested." assistant when
@@ -463,17 +495,20 @@ export class BridgeManager {
             } catch { return { behavior: 'deny', message: 'Only Agent Zoo bridge tools are permitted.' }; }
           },
           includePartialMessages: true,
-          persistSession: false,
+          // Rollback needs the SDK's own transcript; the slot removes it on cleanup.
+          persistSession: this.interruptMode === 'rollback',
           abortController: session.controller,
           spawnClaudeCodeProcess: session.process.spawn,
           env: childEnvironment(this.env, { CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(body.max_tokens), ENABLE_TOOL_SEARCH: 'false' }),
-          ...(session.imported ? { resume: session.imported.sessionId } : { sessionId: randomUUID() }),
+          ...(resume ? { resume: resume.sessionId, resumeSessionAt: resume.resumeSessionAt }
+            : session.imported ? { resume: session.imported.sessionId } : { sessionId: randomUUID() }),
           ...(resumeSessionAt ? { resumeSessionAt } : {}),
           ...(body.thinking ? { thinking: thinkingOption(body.thinking) } : {}),
           ...(body.output_config?.effort !== undefined ? { effort: body.output_config.effort } : {}),
         };
+        this.adoptTranscript(session, options.resume ?? options.sessionId);
         request.sent = true;
-        session.prompts.push(prompt);
+        session.prompts.push(prompt, session.turnPrompt = randomUUID());
         request.phase = 'query_factory';
         session.query = await this.queryFactory({ prompt: session.prompts, options });
         if (session.dead || request.settled) {
@@ -499,7 +534,7 @@ export class BridgeManager {
       if (plan.kind === 'results') {
         session.tools.deliver(plan.results);
         session.unsettledTool = false;
-      } else session.prompts.push(plan.content);
+      } else session.prompts.push(plan.content, session.turnPrompt = randomUUID());
       request.phase = 'iterator';
     }
   }
@@ -531,6 +566,7 @@ export class BridgeManager {
 
   consume(slot, session, sdk) {
     if (sdk.parent_tool_use_id != null) throw upstream('unexpected_subagent'); // subagents are never enabled
+    if (sdk.session_id !== session.sdkSessionId && isSessionId(sdk.session_id)) this.adoptTranscript(session, sdk.session_id);
     if (sdk.type === 'system' && sdk.subtype === 'compact_boundary') throw upstream('unexpected_compaction');
     // Context for a later failure: which plan limit rejected us, and the
     // provider status behind SDK-internal retries.
@@ -689,6 +725,24 @@ export class BridgeManager {
     }
   }
 
+  // The SDK names its transcript by session ID; a resume may continue or fork it.
+  adoptTranscript(session, sessionId) {
+    session.sdkSessionId = sessionId;
+    if (this.interruptMode === 'rollback' && isSessionId(sessionId) && session.cwd) {
+      session.files.add(transcriptPath(sessionId, session.cwd));
+    }
+  }
+
+  async rollbackTarget(session, { messageIds, turnPrompt }) {
+    if (!isSessionId(session?.sdkSessionId) || !turnPrompt || !session.cwd) return null;
+    try {
+      const data = await readFile(transcriptPath(session.sdkSessionId, session.cwd), 'utf8');
+      const records = data.trim().split('\n').map(line => JSON.parse(line));
+      const point = rollbackPoint(records, { messageIds: new Set(messageIds), turnPrompt });
+      return point && { sessionId: session.sdkSessionId, resumeSessionAt: point.resumeSessionAt };
+    } catch { return null; } // Missing or unreadable transcript: rebuild from host history instead.
+  }
+
   mapBlock(session, source) {
     const block = clone(source);
     if (!['text', 'thinking', 'redacted_thinking', 'tool_use'].includes(block?.type)) throw upstream('unsupported_block');
@@ -745,7 +799,7 @@ export class BridgeManager {
       request.reject(error);
       return;
     }
-    if (this.interruptMode !== 'reuse' || !request.sent || !session || session.dead
+    if (this.interruptMode === 'rebuild' || !request.sent || !session || session.dead
         || session.interruption || session.ready || session.unsettledTool
         || session.tools.pendingIds.size || session.tools.hasWaitingCalls
         || typeof session.query?.interrupt !== 'function') {
@@ -757,7 +811,9 @@ export class BridgeManager {
     // This is the HOST prefix, not the SDK's private retained partial answer.
     session.expected = request.messages;
     session.ready = false;
-    const interruption = { result: deferred(), failure: deferred() };
+    // Rollback discards exactly this undelivered answer from the SDK transcript.
+    const messageIds = [request.stream?.message.id, ...(request.continuation?.ids ?? []), request.fallback?.id].filter(Boolean);
+    const interruption = { result: deferred(), failure: deferred(), messageIds, turnPrompt: session.turnPrompt };
     session.interruption = interruption;
     interruption.promise = (async () => {
       let timer, reusable = false;
@@ -802,10 +858,11 @@ export class BridgeManager {
   async cleanupFiles(session) {
     // A stubborn process must not lose the transcript underneath its live fd.
     if (!session.process.didExit || session.settingUp) return;
-    // One deletion per generation: late cleanup must not unlink a newer import
+    // Each owned file is deleted once: late cleanup must not unlink a newer import
     // that happens to use the same path in the slot-owned workspace.
-    session.filesCleanupPromise ??= session.imported?.path
-      ? rm(session.imported.path, { force: true }).catch(() => {}) : Promise.resolve();
+    const paths = [...session.files];
+    session.files.clear();
+    session.filesCleanupPromise = Promise.all([session.filesCleanupPromise, removeFiles(paths)]);
     await session.filesCleanupPromise;
   }
 
@@ -878,6 +935,10 @@ export class BridgeManager {
     clearInterval(this.sweepTimer);
     await Promise.all([...this.sessions.values()].map(slot => this.remove(slot)));
   }
+}
+
+function removeFiles(paths) {
+  return Promise.all([...paths].map(path => rm(path, { force: true }).catch(() => {})));
 }
 
 function messageEvents(message) {

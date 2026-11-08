@@ -48,8 +48,10 @@ export function validateRuntimeMarks(marks, session, budgetMs = 5000, interruptM
   const acks = marks.filter(m => m.event === 'interrupt_ack' && m.query === first?.query);
   const interrupt = interrupts[0], ack = acks[0];
   const oldResult = marks.find(m => m.event === 'sdk_result' && m.query === first?.query);
+  const replacementResult = marks.findLast(m => m.event === 'sdk_result' && m.query === replacement?.query);
+  const imports = marks.filter(m => m.event === 'history_import');
   const checks = {
-    valid_interrupt_mode: ['reuse', 'rebuild'].includes(interruptMode),
+    valid_interrupt_mode: ['rollback', 'reuse', 'rebuild'].includes(interruptMode),
     exactly_two_requests: requests.length === 2 && requests[0]?.request === 1 && requests[1]?.request === 2,
     first_query_correlated: Boolean(first && oldSpawn && requests[0] && firstText
       && requests[0].at_ms <= first.at_ms && first.at_ms <= oldSpawn.at_ms && oldSpawn.at_ms <= firstText.at_ms),
@@ -59,17 +61,16 @@ export function validateRuntimeMarks(marks, session, budgetMs = 5000, interruptM
     replacement_text_after_request: Boolean(requests[1] && text && aborted
       && requests[1].at_ms >= aborted.at_ms && text.at_ms >= requests[1].at_ms),
   };
-  if (interruptMode === 'reuse') Object.assign(checks, {
-    exactly_one_query_and_spawn: queries.length === 1 && spawns.length === 1,
+  // reuse and rollback both interrupt the live SDK turn in place first.
+  const interrupted = {
     interrupt_after_transport_abort: interrupts.length === 1 && Boolean(aborted && interrupt.at_ms >= aborted.at_ms),
     interrupt_ack_before_replacement_text: acks.length === 1 && Boolean(interrupt && text
       && ack.at_ms >= interrupt.at_ms && ack.at_ms <= text.at_ms && ack.queued_count === 0),
     old_sdk_result_before_replacement_text: Boolean(interrupt && oldResult && text
       && oldResult.at_ms >= interrupt.at_ms && oldResult.at_ms < text.at_ms),
-    old_child_alive_until_cleanup: !exit && marks.some(m => m.event === 'child_alive'
-      && m.query === first?.query && text && m.at_ms >= text.at_ms),
-  });
-  else Object.assign(checks, {
+  };
+  // rebuild and rollback both answer from a replacement process.
+  const restarted = {
     exactly_two_requests_and_queries: requests.length === 2 && queries.length === 2 && spawns.length === 2,
     distinct_queries: first?.query !== undefined && replacement?.query !== undefined
       && first.query !== replacement.query,
@@ -78,14 +79,29 @@ export function validateRuntimeMarks(marks, session, budgetMs = 5000, interruptM
     replacement_spawn_after_old_exit: Boolean(newSpawn && exit && replacement && requests[1] && text
       && requests[1].at_ms <= replacement.at_ms && replacement.at_ms <= newSpawn.at_ms
       && exit.at_ms <= newSpawn.at_ms && newSpawn.at_ms <= text.at_ms),
+  };
+  if (interruptMode === 'reuse') Object.assign(checks, interrupted, {
+    exactly_one_query_and_spawn: queries.length === 1 && spawns.length === 1,
+    old_child_alive_until_cleanup: !exit && marks.some(m => m.event === 'child_alive'
+      && m.query === first?.query && text && m.at_ms >= text.at_ms),
   });
+  else if (interruptMode === 'rollback') Object.assign(checks, interrupted, restarted, {
+    replacement_resumes_sdk_transcript: Boolean(replacement?.resumed && replacement.resume_at
+      && first?.sdk_session && replacement.sdk_session === first.sdk_session),
+    host_history_not_reimported: imports.length === 0,
+  });
+  else Object.assign(checks, restarted);
   return { passed: Object.values(checks).every(Boolean), checks, interrupt_mode: interruptMode,
     first_query: first?.query ?? null, replacement_query: replacement?.query ?? null,
     process_restarts: Math.max(0, spawns.length - 1),
     abort_to_sdk_exit_ms: aborted && exit ? exit.at_ms - aborted.at_ms : null,
     abort_to_interrupt_ack_ms: aborted && ack ? ack.at_ms - aborted.at_ms : null,
     abort_to_replacement_first_text_ms: aborted && text ? text.at_ms - aborted.at_ms : null,
-    replacement_arrival_to_first_text_ms: requests[1] && text ? text.at_ms - requests[1].at_ms : null };
+    replacement_arrival_to_first_text_ms: requests[1] && text ? text.at_ms - requests[1].at_ms : null,
+    first_cache_read_tokens: oldResult?.cache_read_input_tokens ?? null,
+    replacement_cache_read_tokens: replacementResult?.cache_read_input_tokens ?? null,
+    replacement_cache_creation_tokens: replacementResult?.cache_creation_input_tokens ?? null,
+    replacement_uncached_input_tokens: replacementResult?.input_tokens ?? null };
 }
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -153,11 +169,11 @@ export async function main(argv = process.argv.slice(2)) {
   const errors = [];
   try {
     const { values } = parseArgs({ args: argv, options: { live: { type: 'boolean', default: false },
-      'interrupt-mode': { type: 'string', default: 'reuse' },
+      'interrupt-mode': { type: 'string', default: 'rollback' },
       python: { type: 'string', default: 'python' }, replicates: { type: 'string', default: '3' } } });
     if (!values.live) throw new Error('LiveInferenceNotAuthorized');
     const interruptMode = values['interrupt-mode'];
-    if (!['reuse', 'rebuild'].includes(interruptMode)) throw new Error('InvalidInterruptMode');
+    if (!['rollback', 'reuse', 'rebuild'].includes(interruptMode)) throw new Error('InvalidInterruptMode');
     const replicates = Number(values.replicates);
     if (!Number.isInteger(replicates) || replicates < 1 || replicates > 10) throw new Error('InvalidReplicates');
     workspace = await mkdtemp(join(tmpdir(), 'azo-runtime-latency-'));

@@ -11,11 +11,14 @@ const { values } = parseArgs({ options: {
   replicates: { type: 'string', default: '3' },
   'history-kib': { type: 'string', default: '0' },
   'prompt-mode': { type: 'string', default: 'append' },
-  'interrupt-mode': { type: 'string', default: 'reuse' },
+  'interrupt-mode': { type: 'string', default: 'rollback' },
 } });
 if (!values.live) throw new Error('Live inference requires explicit --live.');
 const interruptMode = values['interrupt-mode'];
-assert.ok(['reuse', 'rebuild'].includes(interruptMode), 'Invalid interrupt mode');
+assert.ok(['rollback', 'reuse', 'rebuild'].includes(interruptMode), 'Invalid interrupt mode');
+// Unique per run and replicate: identical histories would warm each other's
+// prompt cache and hide a real cache miss.
+const runNonce = randomBytes(6).toString('hex');
 const replicates = Number(values.replicates), historyKiB = Number(values['history-kib']);
 assert.ok(Number.isInteger(replicates) && replicates >= 1 && replicates <= 10);
 assert.ok(Number.isInteger(historyKiB) && historyKiB >= 0 && historyKiB <= 128);
@@ -96,8 +99,8 @@ let passed = false;
 try {
   for (let i = 0; i < replicates; i++) {
     const session = `latency-${i}-${randomBytes(5).toString('hex')}`;
-    const padding = historyKiB ? [user(`Synthetic context; no action required.\n${'alpha beta gamma delta. '.repeat(Math.ceil(historyKiB * 1024 / 24)).slice(0, historyKiB * 1024)}`), asAssistant('Acknowledged.')] : [];
-    const seed = [...padding, user(`Reply exactly BASE_${i}.`)];
+    const padding = historyKiB ? [user(`Synthetic context ${runNonce}-${i}; no action required.\n${'alpha beta gamma delta. '.repeat(Math.ceil(historyKiB * 1024 / 24)).slice(0, historyKiB * 1024)}`), asAssistant('Acknowledged.')] : [];
+    const seed = [...padding, user(`Context ${runNonce}-${i}. Reply exactly BASE_${i}.`)];
     const cold = await call('cold', session, seed, `BASE_${i}`);
     const followHistory = [...seed, asAssistant(cold.text), user(`Reply exactly FOLLOW_${i}.`)];
     const warm = await call('reused', session, followHistory, `FOLLOW_${i}`);
@@ -144,13 +147,25 @@ try {
       assert.equal(steered.row.spawn_count, 1, 'Replacement did not restart the SDK child');
       const newSpawn = marks.find(mark => mark.event === 'spawn');
       assert.ok(newSpawn && newSpawn.at_ms >= exit.at_ms, 'Replacement spawned before old child exited');
+      if (interruptMode === 'rollback') {
+        assert.equal(interrupts.length, 1, 'Rollback must interrupt the old turn in place first');
+        assert.ok(ack?.queued_count === 0, 'Invalid interrupt acknowledgment');
+        const replacement = marks.find(mark => mark.event === 'query_construct');
+        const original = observation.marks.findLast(mark => mark.event === 'query_construct' && mark.query === oldProcess);
+        assert.ok(replacement?.resume_at && replacement.sdk_session === original?.sdk_session,
+          'Replacement did not resume the SDK transcript');
+        assert.equal(marks.filter(mark => mark.event === 'history_import').length, 0, 'Rollback re-imported host history');
+      }
     }
     emit({ kind: 'steering', replicate: i, history_kib: historyKiB, interrupt_mode: interruptMode,
       process_restarts: steered.row.spawn_count,
       cancel_to_resubmit_ms: steered.started - interrupted.canceledAt,
       cancel_to_replacement_first_text_ms: steered.firstText - interrupted.canceledAt,
       cancel_to_interrupt_ack_ms: ack ? ack.at_ms - interrupted.canceledAt : null,
-      cancel_to_old_child_exit_ms: exit ? exit.at_ms - interrupted.canceledAt : null, matched: steered.row.matched });
+      cancel_to_old_child_exit_ms: exit ? exit.at_ms - interrupted.canceledAt : null, matched: steered.row.matched,
+      steered_cache_read_tokens: steered.row.usage.cache_read_input_tokens ?? null,
+      steered_cache_creation_tokens: steered.row.usage.cache_creation_input_tokens ?? null,
+      steered_uncached_input_tokens: steered.row.usage.input_tokens ?? null });
     await clear(session);
   }
   passed = true;

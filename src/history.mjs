@@ -192,6 +192,14 @@ export function validateHistory(messages) {
   prepareMessages(messages, undefined, { allowPending: false, mapTools: false });
 }
 
+export const isSessionId = value => typeof value === 'string' && UUID.test(value);
+
+/** Where the CLI keeps a session's transcript for this working directory. The
+ * same location serves imports, persisted SDK sessions, and resumes. */
+export function transcriptPath(sessionId, cwd) {
+  if (!isSessionId(sessionId)) throw invalid('Session ID must be a UUID.');
+  return getSessionPath(sessionId, normalizeProjectPath(cwd), process.env.CLAUDE_CONFIG_DIR);
+}
 /** Import a complete native historical prefix into a fresh private transcript.
  * Signed/redacted thinking is preserved verbatim. The caller must explicitly
  * remove incompatible provider signatures BEFORE canonical comparison/import;
@@ -200,11 +208,11 @@ export function validateHistory(messages) {
  * The caller owns the returned file (and any later SDK artifacts) and cleanup.
  */
 export async function importSession({ messages, toolNameToSdk, cwd, model = 'unknown', sessionId = randomUUID() }) {
-  if (typeof sessionId !== 'string' || !UUID.test(sessionId)) throw invalid('Session ID must be a UUID.');
+  if (!isSessionId(sessionId)) throw invalid('Session ID must be a UUID.');
   if (typeof cwd !== 'string' || !isAbsolute(cwd) || cwd.includes('\0')) throw invalid('Session cwd must be an absolute path.');
   const prepared = prepareMessages(messages, toolNameToSdk);
   const projectPath = normalizeProjectPath(cwd);
-  const path = getSessionPath(sessionId, projectPath, process.env.CLAUDE_CONFIG_DIR);
+  const path = transcriptPath(sessionId, cwd);
   const session = new Session({ sessionId, projectPath, cwd: projectPath, jsonlPath: path, model });
   for (const message of prepared) {
     if (message.role === 'assistant') session.addAssistantMessage(message.content);

@@ -391,4 +391,4 @@ def test_runtime_launcher_malformed_child_output_fails_closed_without_leaking(tm
     assert rows[0]["max_tokens"] == 2048
     assert rows[0]["thinking"] == "sdk_default"
     assert rows[0]["system_prompt_mode"] == "append"
-    assert rows[0]["interrupt_mode"] == "reuse"
+    assert rows[0]["interrupt_mode"] == "rollback"

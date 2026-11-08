@@ -31,7 +31,9 @@ export function measuredManager(options = {}, observe = () => {}) {
     },
     queryFactory(options) {
       const index = queryCount++;
-      mark('query_construct', { query: index, resumed: Boolean(options.options.resume) });
+      mark('query_construct', { query: index, resumed: Boolean(options.options.resume),
+        sdk_session: options.options.resume ?? options.options.sessionId ?? null,
+        resume_at: Boolean(options.options.resumeSessionAt) });
       const sdk = query(options);
       return {
         close: () => sdk.close(),
@@ -46,7 +48,10 @@ export function measuredManager(options = {}, observe = () => {}) {
             if (message.type === 'system' && message.subtype === 'init')
               mark('sdk_init', { query: index, model: message.model, tools: message.tools?.length ?? null });
             if (message.type === 'result') mark('sdk_result', { query: index, is_error: Boolean(message.is_error),
-              subtype: message.subtype, duration_api_ms: message.duration_api_ms ?? null });
+              subtype: message.subtype, duration_api_ms: message.duration_api_ms ?? null,
+              input_tokens: message.usage?.input_tokens ?? null,
+              cache_read_input_tokens: message.usage?.cache_read_input_tokens ?? null,
+              cache_creation_input_tokens: message.usage?.cache_creation_input_tokens ?? null });
             yield message;
           }
         },

@@ -137,7 +137,9 @@ test('locked-down SDK options preserve prompt blocks, thinking, and raw stream c
   assert.equal(o.settings.autoMemoryEnabled, false); assert.equal(o.settings.includeGitInstructions, false);
   assert.equal(o.env.ANTHROPIC_API_KEY, undefined); assert.equal(o.env.ANTHROPIC_BASE_URL, undefined);
   assert.equal(o.env.AZO_CLAUDE_BRIDGE_KEY, undefined); assert.equal(o.env.CLAUDE_CODE_ENTRYPOINT, undefined);
-  assert.equal(o.persistSession, false); assert.equal(o.permissionMode, 'default');
+  // Default rollback mode keeps the SDK transcript; prompts carry transcript UUIDs.
+  assert.equal(o.persistSession, true); assert.equal(o.permissionMode, 'default');
+  assert.match(f.queries[0].prompts[0].uuid, /^[0-9a-f-]{36}$/);
   assert.deepEqual(o.thinking, { type: 'enabled', budgetTokens: 64 }); assert.equal(o.effort, 'high');
   assert.equal(o.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS, '128');
   assert.equal(o.env.CLAUDE_CODE_SIMPLE, undefined);
@@ -629,7 +631,7 @@ test('thinking interruption coalesces superseded user feedback without duplicate
     if (q.prompts.length > 1) { q.respond([{ type: 'text', text: 'steered' }]); return; }
     q.interrupt = () => { interrupts++; return new Promise(resolve => { receipt = resolve; }); };
     pendingProgress(q, 'thinking');
-  });
+  }, { interruptMode: 'reuse' });
   const first = body(), stop = new AbortController();
   const old = f.manager.handle(first, { sessionId: 's', signal: stop.signal });
   await until(() => f.manager.sessions.get('s')?.current?.stream?.blocks.size);

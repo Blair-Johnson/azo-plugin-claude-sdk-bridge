@@ -10,7 +10,7 @@ const { values } = parseArgs({ options: {
   'timeout-seconds': { type: 'string', default: '0' },
   'max-sessions': { type: 'string', default: '16' },
   'system-prompt-mode': { type: 'string', default: 'append' },
-  'interrupt-mode': { type: 'string', default: 'reuse' },
+  'interrupt-mode': { type: 'string', default: 'rollback' },
 } });
 if (values.help) {
   console.log('Agent Zoo Claude SDK bridge (opt-in, loopback only)\n' +
@@ -18,7 +18,7 @@ if (values.help) {
     'Local key: AZO_CLAUDE_BRIDGE_KEY, minimum 32 characters; never a Claude credential.\n' +
     'Controls: --idle-seconds 300 --timeout-seconds 0 (no total deadline) --max-sessions 16\n' +
     'Prompt: --system-prompt-mode append (reference default) or custom\n' +
-    'Interruption: --interrupt-mode reuse (default) or rebuild\n' +
+    'Interruption: --interrupt-mode rollback (default), reuse, or rebuild\n' +
     'Uses the Claude Agent SDK login. Does not enable or change extra-usage settings.');
 } else {
   let endpoint;
