@@ -84,7 +84,7 @@ export function requestFingerprint(body) {
   return digest(canonical);
 }
 
-function validateBlock(block, role, nested = false) {
+function validateBlock(block, role, nested = false, host = false) {
   switch (block.type) {
     case 'text':
       if (typeof block.text !== 'string') throw invalid('Text blocks require text.');
@@ -125,6 +125,15 @@ function validateBlock(block, role, nested = false) {
       // An absent/empty result is a valid real tool outcome, not a synthetic turn.
       for (const child of block.content ?? []) validateBlock(child, 'user', true);
       break;
+    case 'server_tool_use':
+      // Host-side record of a search the SDK ran; lowered to WebSearch before import.
+      if (!host || role !== 'assistant' || nested || !TOOL_ID.test(block.id ?? '') || typeof block.name !== 'string'
+          || !object(block.input)) throw invalid('Invalid server tool use block.');
+      break;
+    case 'web_search_tool_result':
+      if (!host || role !== 'assistant' || nested || !TOOL_ID.test(block.tool_use_id ?? '')
+          || !(Array.isArray(block.content) || object(block.content))) throw invalid('Invalid web search result block.');
+      break;
     default:
       throw invalid('Unsupported history content block type.');
   }
@@ -144,7 +153,8 @@ function prepareMessages(messages, toolNameToSdk, { allowPending = true, mapTool
     if (!blocks.length || !blocks.some((block) => block.type !== 'text' || block.text?.length)) {
       throw invalid('Empty history messages are not supported.');
     }
-    for (const block of blocks) validateBlock(block, message.role);
+    // Host history may hold server search records; SDK imports never do.
+    for (const block of blocks) validateBlock(block, message.role, false, !mapTools);
     if (message.role === 'assistant') {
       if (pending.size) throw invalid('Tool results are missing before an assistant turn.');
       for (const block of blocks) {

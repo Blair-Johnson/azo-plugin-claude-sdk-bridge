@@ -27,3 +27,7 @@ llm:
           stream: true
           thinking:
             type: adaptive
+          # Server web search, run by the Claude SDK; remove to disable.
+          tools:
+            - type: web_search_20250305
+              name: web_search

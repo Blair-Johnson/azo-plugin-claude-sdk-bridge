@@ -34,8 +34,14 @@ export function rollbackPoint(records, { messageIds, turnPrompt }) {
   }
   const start = chain.findIndex(record => record.uuid === turnPrompt);
   if (start < 0) return null;
+  // Tools the SDK ran itself inside the undelivered answer (web search) leave
+  // tool_result records that belong to that answer too.
+  const ownCalls = new Set(chain.slice(start).filter(record => record.type === 'assistant' && messageIds.has(record.message?.id))
+    .flatMap(record => (record.message?.content ?? []).filter(block => block?.type === 'tool_use').map(block => block.id)));
+  const ownResults = record => record.type === 'user' && Array.isArray(record.message?.content) && record.message.content.length > 0
+    && record.message.content.every(block => block?.type === 'tool_result' && ownCalls.has(block.tool_use_id));
   const dropped = record => record.type === 'assistant' && messageIds.has(record.message?.id)
-    || record.type === 'user' && MARKER.test(text(record));
+    || record.type === 'user' && MARKER.test(text(record)) || ownResults(record);
   let cut = chain.findIndex((record, index) => index > start && dropped(record));
   if (cut < 0) cut = chain.length;
   // A queued user message or a real tool result past the cut is not ours to drop.

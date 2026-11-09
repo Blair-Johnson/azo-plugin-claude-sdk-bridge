@@ -9,7 +9,8 @@ const manager = {
     assert.equal(sessionId, 'native-azo-fixture');
     assert.equal(body.model, 'sonnet');
     assert.match(JSON.stringify(body.system), /Host-owned instructions/);
-    assert.equal(body.tools[0].name, 'probe_add');
+    // The example config's server web search tool precedes the runtime tool.
+    assert.deepEqual(body.tools.map(tool => tool.type ?? tool.name), ['web_search_20250305', 'probe_add']);
     const turn = ++calls;
     if (turn === 2) {
       const history = body.messages.flatMap(m => Array.isArray(m.content) ? m.content : []);

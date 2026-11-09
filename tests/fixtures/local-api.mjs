@@ -22,8 +22,14 @@ function streamMessage(response, body, content, index, usage, stopReason) {
     if (block.type === 'text') {
       emit('content_block_start', { index: blockIndex, content_block: { type: 'text', text: '' } });
       emit('content_block_delta', { index: blockIndex, delta: { type: 'text_delta', text: block.text } });
+      for (const citation of block.citations ?? []) {
+        emit('content_block_delta', { index: blockIndex, delta: { type: 'citations_delta', citation } });
+      }
+    } else if (block.type === 'web_search_tool_result') {
+      // Server tool results arrive whole in content_block_start, as upstream.
+      emit('content_block_start', { index: blockIndex, content_block: block });
     } else {
-      assert.equal(block.type, 'tool_use');
+      assert.ok(['tool_use', 'server_tool_use'].includes(block.type));
       emit('content_block_start', { index: blockIndex, content_block: { ...block, input: {} } });
       // Split JSON to exercise the actual SDK's streaming tool-argument assembly.
       const json = JSON.stringify(block.input);
@@ -206,7 +212,8 @@ export async function offlineSdk(t, reply, { usage, managerOptions = {} } = {}) 
         const queryIndex = queries.length;
         factoryOptions.push({ resume: args.options.resume, sessionId: args.options.sessionId });
         assert.deepEqual(Object.keys(args.options.mcpServers), ['azo']);
-        assert.deepEqual(args.options.tools, []);
+        // The only built-in tool ever enabled is WebSearch, when the host asked for it.
+        assert.ok([[], ['WebSearch']].some(allowed => JSON.stringify(allowed) === JSON.stringify(args.options.tools)));
         assert.deepEqual(args.options.skills, []);
         assert.deepEqual(args.options.settingSources, []);
         assert.equal(args.options.strictMcpConfig, true);

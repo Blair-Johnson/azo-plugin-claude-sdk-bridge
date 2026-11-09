@@ -21,9 +21,10 @@ const textOf = content => typeof content === 'string' ? content
 let hostCalls = 0;
 const runtime = await offlineSdk({ after(fn) { cleanup.push(fn); } }, (body, index) => {
   assert.ok(textOf(body.system).includes('Host-owned instructions'));
-  assert.equal(body.tools.length, 1, 'No built-in, removed, or external MCP tool is allowed');
-  assert.equal(body.tools[0].name, NAME);
-  assert.deepEqual(body.tools[0].input_schema, SCHEMA);
+  // The example config enables server web search: only built-in WebSearch joins the host tool.
+  assert.deepEqual(body.tools.map(tool => tool.name).sort(), [NAME, 'WebSearch'].sort(),
+    'No other built-in, removed, or external MCP tool is allowed');
+  assert.deepEqual(body.tools.find(tool => tool.name === NAME).input_schema, SCHEMA);
   const blocks = body.messages.flatMap(message => Array.isArray(message.content) ? message.content : []);
   const uses = blocks.filter(block => block.type === 'tool_use');
   const results = blocks.filter(block => block.type === 'tool_result');
@@ -74,9 +75,8 @@ const manager = {
     assert.equal(context.sessionId, 'native-azo-fixture');
     assert.equal(body.model, 'sonnet');
     assert.ok(textOf(body.system).includes('Host-owned instructions'));
-    assert.equal(body.tools.length, 1);
-    assert.equal(body.tools[0].name, 'probe_add');
-    assert.deepEqual(body.tools[0].input_schema, SCHEMA);
+    assert.deepEqual(body.tools.map(tool => tool.type ?? tool.name), ['web_search_20250305', 'probe_add']);
+    assert.deepEqual(body.tools[1].input_schema, SCHEMA);
     const turn = ++hostCalls;
     assert.ok(turn <= 2);
     try {
