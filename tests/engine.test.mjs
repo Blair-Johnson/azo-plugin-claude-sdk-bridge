@@ -463,6 +463,28 @@ function fallback(q, id, content, stop_reason = null) {
     message: { id, role: 'assistant', model: 'claude-test', content, stop_reason } });
 }
 
+test('CLI heartbeats for a parked host call are status, not subagent frames', async t => {
+  const f = await fixture(t, q => {
+    // The CLI names the still-running call as parent_tool_use_id every 30 seconds.
+    q.raw({ type: 'tool_progress', tool_use_id: 'a-heartbeat-0', tool_name: q.options.allowedTools[0],
+      parent_tool_use_id: 'a', elapsed_time_seconds: 30, heartbeat: true, uuid: randomUUID(), session_id: 'sdk' });
+    q.respond([use('a'), use('b')], { stop: 'tool_use' });
+  });
+  const response = await f.manager.handle(body(), { sessionId: 's' });
+  assert.equal(response.stop_reason, 'tool_use');
+  assert.deepEqual(response.content.map(block => block.id), ['a', 'b']);
+});
+
+test('subagent content still fails and names the frame', async t => {
+  const f = await fixture(t, q => q.raw({ type: 'assistant', uuid: randomUUID(), parent_tool_use_id: 'toolu_parent',
+    message: { id: 'nested', role: 'assistant', model: 'claude-test', content: [{ type: 'text', text: 'nested' }] } }));
+  await assert.rejects(f.manager.handle(body(), { sessionId: 's' }), error => {
+    assert.equal(error.statusCode, 502);
+    assert.match(error.message, /\[reason=unexpected_subagent\]/);
+    assert.match(error.message, /type=assistant parent_tool_use_id=toolu_parent/);
+    return true;
+  });
+});
 test('live deltas keep a host progress watchdog alive beyond its deadline', async t => {
   const progressMs = 100;
   let timer, deltas = 0;

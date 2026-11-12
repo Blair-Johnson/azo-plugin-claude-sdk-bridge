@@ -582,7 +582,12 @@ export class BridgeManager {
   }
 
   consume(slot, session, sdk) {
-    if (sdk.parent_tool_use_id != null) throw upstream('unexpected_subagent'); // subagents are never enabled
+    // Status only. The CLI's 30-second tool_heartbeat names the still-running call
+    // as parent_tool_use_id: that is an ordinary host call parked while the rest of
+    // its batch streams, not a subagent.
+    if (sdk.type === 'tool_progress') return;
+    if (sdk.parent_tool_use_id != null) throw upstream('unexpected_subagent', // subagents are never enabled
+      `type=${sdk.type}${sdk.subtype ? ` subtype=${sdk.subtype}` : ''} parent_tool_use_id=${sdk.parent_tool_use_id}`);
     if (sdk.session_id !== session.sdkSessionId && isSessionId(sdk.session_id)) this.adoptTranscript(session, sdk.session_id);
     if (sdk.type === 'system' && sdk.subtype === 'compact_boundary') throw upstream('unexpected_compaction');
     // Context for a later failure: which plan limit rejected us, and the
