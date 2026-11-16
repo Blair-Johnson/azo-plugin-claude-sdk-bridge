@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFile, rm } from 'node:fs/promises';
 import { createWorkspace } from './workspace.mjs';
-import { ToolBridge } from './tools.mjs';
+import { ToolBridge, toolLabel } from './tools.mjs';
 import { canonicalMessages, digest, importSession, isSessionId, requestFingerprint, transcriptPath, validateHistory } from './history.mjs';
 import { rollbackPoint } from './rollback.mjs';
 import { HOST_WEB_SEARCH, SDK_WEB_SEARCH, lowerServerTools, searchPermission, searchResultBlock, serverTools } from './websearch.mjs';
@@ -67,6 +67,9 @@ function providerFailure(reason, sdk, session) {
   return failure;
 }
 const clone = value => structuredClone(value);
+// The CLI answers a call to a tool it does not have ("No such tool available")
+// and the model retries. Bound how often that may repeat within one host response.
+const MAX_UNAVAILABLE_CALLS = 8;
 
 function streamFailure(reason, request, nextId, session) {
   const stream = request.stream;
@@ -557,25 +560,28 @@ export class BridgeManager {
   }
 
   async pump(slot, session) {
-    let phase = 'iterator';
+    const failed = (error, phase) => {
+      if (session.interruption) session.interruption.failure.resolve(false);
+      else if (!session.dead && slot.current && !slot.current.settled) this.fail(slot, slot.current,
+        bridgeError(error, phase === 'iterator' ? 'iterator_failed' : 'sdk_message_invalid'), phase);
+    };
     try {
       for await (const message of session.query) {
         if (session.dead) break;
-        phase = 'consume';
-        this.consume(slot, session, message);
-        phase = 'iterator';
+        // Fail and start disposal BEFORE leaving the loop: exiting a for-await
+        // awaits the SDK iterator's return(), during which the CLI keeps running.
+        try { this.consume(slot, session, message); }
+        catch (error) { failed(error, 'consume'); break; }
       }
       if (!session.dead) {
         // Exhaustion is NOT an ordinary SDK result boundary. A later request
         // rebuilds rather than writing into an already exhausted prompt stream.
         session.dead = true;
         if (session.interruption) session.interruption.failure.resolve(false);
-        else if (slot.current && !slot.current.settled) this.fail(slot, slot.current, upstream('iterator_exhausted'), phase);
+        else if (slot.current && !slot.current.settled) this.fail(slot, slot.current, upstream('iterator_exhausted'), 'iterator');
       }
     } catch (error) {
-      if (session.interruption) session.interruption.failure.resolve(false);
-      else if (!session.dead && slot.current && !slot.current.settled) this.fail(slot, slot.current,
-        bridgeError(error, phase === 'iterator' ? 'iterator_failed' : 'sdk_message_invalid'), phase);
+      failed(error, 'iterator');
     } finally {
       await this.dispose(session);
     }
@@ -594,8 +600,11 @@ export class BridgeManager {
     // provider status behind SDK-internal retries.
     if (sdk.type === 'rate_limit_event') { session.rateLimit = sdk.rate_limit_info; return; }
     if (sdk.type === 'system' && sdk.subtype === 'api_retry') { session.lastRetry = sdk; return; }
-    // Only host tools park the SDK; its own searches settle inside the turn.
-    const hostCall = block => block?.type === 'tool_use' && block.name !== SDK_WEB_SEARCH;
+    // Only host tools park the SDK; its own searches and its answers to
+    // unavailable tools settle inside the turn. After an interrupt, any late call
+    // means the old turn is still running, so its process cannot be reused.
+    const hostCall = block => block?.type === 'tool_use' && block.name !== SDK_WEB_SEARCH
+      && (session.interruption || session.tools.hasSdkName(block.name));
     const hasTool = sdk.type === 'assistant' && !session.emitted.has(sdk.message?.id)
       && sdk.message?.content?.some(hostCall)
       || sdk.type === 'stream_event' && sdk.event?.type === 'content_block_start' && hostCall(sdk.event.content_block);
@@ -616,8 +625,10 @@ export class BridgeManager {
         if (request.stream?.stopped && request.stream.message.stop_reason === 'max_tokens') {
           throw streamFailure('output_limit_without_continuation', request, undefined, session);
         }
-        if (request.stream?.stopped && searchOnly(request.stream.message)) {
-          throw streamFailure('web_search_without_continuation', request, undefined, session);
+        if (request.stream?.stopped && sdkOnly(request.stream.message)) {
+          const search = request.stream.message.content.some(block => block.type === 'server_tool_use');
+          throw streamFailure(search ? 'web_search_without_continuation' : 'unavailable_tool_without_continuation',
+            request, undefined, session);
         }
         const message = request.complete ?? request.fallback;
         if (!message) throw upstream('result_without_message');
@@ -645,7 +656,7 @@ export class BridgeManager {
         request.complete = null;
       }
       const message = clone(sdk.message);
-      message.content = message.content.map(block => this.mapBlock(session, block));
+      message.content = message.content.map(block => this.mapBlock(session, request, block)).filter(Boolean);
       if (request.fallback && request.fallback.id !== message.id) request.fallback = null;
       if (request.fallback) {
         request.fallback.content.push(...message.content);
@@ -677,8 +688,9 @@ export class BridgeManager {
       }
       const message = clone(event.message);
       if (message.content?.length) throw upstream('nonempty_message_start');
-      // A search-only segment continues in the SDK's next message, like max_tokens.
-      if (previous?.stopped && (previous.message.stop_reason === 'max_tokens' || searchOnly(previous.message))) {
+      // A segment whose calls the SDK settled itself (searches, unavailable tools)
+      // continues in the SDK's next message, like max_tokens.
+      if (previous?.stopped && (previous.message.stop_reason === 'max_tokens' || sdkOnly(previous.message))) {
         if (message.model !== previous.message.model) {
           throw streamFailure('continuation_model_changed', request, message.id, session);
         }
@@ -690,7 +702,7 @@ export class BridgeManager {
       message.content = [];
       event.message = clone(message);
       request.fallback = null;
-      request.stream = { message, events: request.continuation ? previous.events : [event], blocks: new Map(), stopped: false,
+      request.stream = { message, events: request.continuation ? previous.events : [event], blocks: new Map(), hidden: new Set(), stopped: false,
         published: request.continuation?.published ?? false, offset: request.continuation?.content.length ?? 0, prefix: [] };
       // Results the SDK produced after the previous host response (a mixed batch)
       // lead this response, right before the model's first new block.
@@ -706,12 +718,20 @@ export class BridgeManager {
     if (!stream || stream.stopped) throw upstream('stream_boundary_invalid');
     if (event.type === 'content_block_start') {
       if (!Number.isInteger(event.index) || event.index < 0 || stream.blocks.has(event.index)) throw upstream('block_index_invalid');
-      const block = this.mapBlock(session, event.content_block);
-      event.content_block = clone(block);
+      const block = this.mapBlock(session, request, event.content_block);
       stream.blocks.set(event.index, { block, json: '', closed: false });
+      if (!block) {
+        // A hidden block has no host index; later blocks close the gap. Blocks
+        // that already started above it were published and cannot be renumbered.
+        if ([...stream.blocks.keys()].some(index => index > event.index)) throw upstream('block_index_invalid');
+        stream.hidden.add(event.index);
+        return;
+      }
+      event.content_block = clone(block);
     } else if (event.type === 'content_block_delta') {
       const entry = stream.blocks.get(event.index);
       if (!entry || entry.closed) throw upstream('block_boundary_invalid');
+      if (!entry.block) return;
       const block = entry.block, delta = event.delta;
       if (delta.type === 'text_delta' && block.type === 'text') block.text += delta.text;
       else if (delta.type === 'thinking_delta' && block.type === 'thinking') block.thinking += delta.thinking;
@@ -722,8 +742,9 @@ export class BridgeManager {
     } else if (event.type === 'content_block_stop') {
       const entry = stream.blocks.get(event.index);
       if (!entry || entry.closed) throw upstream('block_boundary_invalid');
-      if (entry.json) entry.block.input = JSON.parse(entry.json);
       entry.closed = true;
+      if (!entry.block) return;
+      if (entry.json) entry.block.input = JSON.parse(entry.json);
     } else if (event.type === 'message_delta') {
       Object.assign(stream.message, event.delta);
       stream.message.usage = { ...stream.message.usage, ...event.usage };
@@ -734,7 +755,7 @@ export class BridgeManager {
     } else if (event.type === 'message_stop') {
       const entries = [...stream.blocks.entries()].sort(([a], [b]) => a - b);
       if (entries.some(([index, entry], i) => index !== i || !entry.closed)) throw upstream('incomplete_stream_blocks');
-      stream.message.content = [...stream.prefix, ...entries.map(([, entry]) => entry.block)];
+      stream.message.content = [...stream.prefix, ...entries.map(([, entry]) => entry.block).filter(Boolean)];
       stream.stopped = true;
       if (stream.message.stop_reason === 'max_tokens') {
         // The SDK may already be waiting on these calls: never dispatch a
@@ -748,7 +769,7 @@ export class BridgeManager {
         request.complete = null;
         return;
       }
-      if (searchOnly(stream.message)) {
+      if (sdkOnly(stream.message)) {
         // Withhold the boundary: results, then the SDK's next message, follow.
         request.complete = null;
         this.publish(slot, request, this.appendSearchResults(session, request));
@@ -760,7 +781,10 @@ export class BridgeManager {
       if (stream.delta) stream.events.push({ ...stream.delta, usage: clone(request.complete.usage) });
     } else throw upstream('unsupported_event');
     // Validate local SDK indexes above; only transport indexes are offset.
-    if ('index' in event) event.index += stream.offset + stream.prefix.length;
+    if ('index' in event) {
+      const hidden = [...stream.hidden].filter(index => index < event.index).length;
+      event.index += stream.offset + stream.prefix.length - hidden;
+    }
     stream.events.push(event);
     if (stream.stopped && stream.message.stop_reason === 'tool_use') {
       this.finish(slot, session, request, request.complete, stream.events);
@@ -788,13 +812,25 @@ export class BridgeManager {
     } catch { return null; } // Missing or unreadable transcript: rebuild from host history instead.
   }
 
-  mapBlock(session, source) {
+  /** The host form of one SDK block, or null for a block the host never sees. */
+  mapBlock(session, request, source) {
     const block = clone(source);
     if (!['text', 'thinking', 'redacted_thinking', 'tool_use'].includes(block?.type)) throw upstream('unsupported_block');
     if (block.type === 'tool_use' && block.name === SDK_WEB_SEARCH && session.webSearch) {
       // The SDK runs this search itself: report it as the native server tool.
       if (!session.searches.has(block.id)) session.searches.set(block.id, { committed: false, result: false });
       return { type: 'server_tool_use', id: block.id, name: HOST_WEB_SEARCH, input: block.input ?? {} };
+    }
+    if (block.type === 'tool_use' && !session.tools.hasSdkName(block.name)) {
+      // A tool the model invented or a disabled built-in. The CLI answers it with
+      // "No such tool available" and the model continues; the host has nothing to run.
+      const calls = request.unavailableCalls ??= new Map();
+      calls.set(block.id, block.name);
+      if (calls.size > MAX_UNAVAILABLE_CALLS) {
+        const names = [...new Set(calls.values())].map(toolLabel).join(', ');
+        throw upstream('unavailable_tool_loop', `The model called unavailable tools ${calls.size} times in one response: ${names}.`);
+      }
+      return null;
     }
     if (block.type === 'tool_use') block.name = session.tools.fromSdkName(block.name);
     return block;
@@ -812,7 +848,7 @@ export class BridgeManager {
     }
     if (!found.length || session.interruption) return;
     const request = slot.current;
-    if (request && !request.settled && request.stream?.stopped && searchOnly(request.stream.message)) {
+    if (request && !request.settled && request.stream?.stopped && sdkOnly(request.stream.message)) {
       this.publish(slot, request, this.appendSearchResults(session, request));
     }
   }
@@ -1033,10 +1069,10 @@ function removeFiles(paths) {
   return Promise.all([...paths].map(path => rm(path, { force: true }).catch(() => {})));
 }
 
-// The SDK ran every call in this message itself; the host has nothing to execute.
-function searchOnly(message) {
-  return message.stop_reason === 'tool_use' && message.content.some(block => block.type === 'server_tool_use')
-    && !message.content.some(block => block.type === 'tool_use');
+// The SDK settled every call in this message itself (searches it ran, tools it
+// does not have); the host has nothing to execute.
+function sdkOnly(message) {
+  return message.stop_reason === 'tool_use' && !message.content.some(block => block.type === 'tool_use');
 }
 
 function blockEvents(block, index) {

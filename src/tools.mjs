@@ -19,6 +19,11 @@ function record(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     && [Object.prototype, null].includes(Object.getPrototypeOf(value));
 }
+/** A model-chosen tool name, bounded and quoted for diagnostics. */
+export function toolLabel(name) {
+  const text = typeof name === 'string' ? name : String(name);
+  return JSON.stringify(text.length > 80 ? `${text.slice(0, 80)}…` : text);
+}
 function hash(text) {
   return createHash('sha256').update(text).digest('base64url');
 }
@@ -154,8 +159,9 @@ export class ToolBridge {
     assert(this.#hostNames.has(hostName), 'Unknown host tool name.');
     return this.#hostNames.get(hostName);
   }
+  hasSdkName(sdkName) { return this.#sdkNames.has(sdkName); }
   fromSdkName(sdkName) {
-    assert(this.#sdkNames.has(sdkName), 'Unknown SDK tool name.');
+    assert(this.#sdkNames.has(sdkName), `Unknown SDK tool name: ${toolLabel(sdkName)}.`);
     return this.#sdkNames.get(sdkName);
   }
   #assertOpen() { assert(!this.#closed, 'Tool bridge is closed.'); }
