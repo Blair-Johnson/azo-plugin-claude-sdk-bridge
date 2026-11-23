@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 
-from agent_zoo.wsctl import AzoWs
+from agent_zoo.cli.wsctl import AzoWs
 
 
 def processes():
@@ -37,8 +37,8 @@ def answered(obs, marker):
 
 
 async def run(args):
-    from agents import llm
-    if Path(llm.__file__).resolve().parent.parent != args.expected_source.resolve():
+    from agent_zoo import llm
+    if Path(llm.__file__).resolve().parent.parent.parent != args.expected_source.resolve():
         raise RuntimeError("Unexpected installed source")
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)

@@ -8,8 +8,8 @@ import time
 import urllib.request
 import uuid
 
-from agent_zoo.config_loader import load_layered_config
-from agents import llm
+from agent_zoo.config.loader import load_layered_config
+from agent_zoo import llm
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--live", action="store_true", required=True)

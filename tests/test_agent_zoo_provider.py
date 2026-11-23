@@ -13,7 +13,7 @@ import subprocess
 import pytest
 import yaml
 
-from agents.llm import make_llm_fn
+from agent_zoo.llm import make_llm_fn
 
 ROOT = Path(__file__).resolve().parents[1]
 KEY = "synthetic-local-bridge-key-not-claude-12345"

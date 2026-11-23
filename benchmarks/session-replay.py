@@ -24,7 +24,7 @@ parser.add_argument('--request', action='store_true', help='Emit native request 
 args = parser.parse_args()
 session, loaded = load_readonly(args)
 if args.request:
-    from agents.llm import _messages_to_anthropic_messages
+    from agent_zoo.llm.providers.anthropic import _messages_to_anthropic_messages
     messages = [message for entry in session.state.entries for message in entry.messages]
     native = _messages_to_anthropic_messages(messages)
     names = sorted({block['name'] for message in native for block in message['content']

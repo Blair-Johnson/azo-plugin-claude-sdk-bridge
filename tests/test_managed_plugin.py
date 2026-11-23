@@ -1,8 +1,10 @@
-"""Managed bridge lifecycle tests: real Session + local control-only Node child.
+"""Managed bridge lifecycle tests: real Session/Runtime + local control-only Node child.
 
 No Claude authentication, SDK import, inference, or production managed.mjs is
 needed. The fixture exercises the actual Popen/pipe/process-group boundary.
 """
+
+from __future__ import annotations
 
 import copy
 import importlib.util
@@ -18,10 +20,23 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_utils import PipelineBuilder, Session
-from agent_utils.types import State
-from agent_zoo.runtime.live_backend import _notify_startup_ready
-from agent_zoo.runtime_support import bind_session_runtime, restore_session_state
+from agent_utils.core.events import BeforeLLM, RenderRequested
+from agent_utils.core.pipeline import PipelineBuilder
+from agent_utils.core.session import Session
+from agent_utils.core.state import State
+from agent_utils.features.core import core_feature
+from agent_utils.runtime.loop import Runtime
+from agent_utils.storage.repository import StoredState
+from agent_utils.storage.serialization import (
+    capture_session_document,
+    load_session_json,
+    restore_session_document,
+    save_session_json,
+)
+from agent_zoo.events import SessionReady
+from agent_zoo.pipelines.default import build_default_builder
+from agent_zoo.storage.load import LoadedSession
+from agent_zoo.storage.serialization import restore_session_state
 
 
 PLUGIN = Path(__file__).resolve().parents[1] / "plugin/claude_sdk_bridge.py"
@@ -122,53 +137,62 @@ def config():
     }}}
 
 
-def component(plugin, session, cfg, root=None):
-    features = []
-    plugin.register_features(SimpleNamespace(add=features.append), session=session, config=cfg)
-    assert len(features) == 1
-    result = features[0].components[0]
+def build_runtime(plugin, cfg, root=None):
+    session = Session()
+    builder = PipelineBuilder().add(core_feature())
+    plugin.register_features(builder, session=session, config=cfg)
+    session.pipeline = builder.build(suppress_warnings=True)
+    drivers = builder.build_drivers(cfg)
+    handler = next(c for c in session.pipeline.components if isinstance(c, plugin.ManagedBridge))
     if root is not None:
-        result.service.root = root
-    session.pipeline = [result]
-    return result
+        handler.service.root = root
+    runtime = Runtime(session, drivers=drivers)
+    return session, runtime, handler
 
 
-def bind(session, identity="session-one"):
-    bind_session_runtime(session, session_id=identity, project_name="test", db=SimpleNamespace())
+def drain(runtime):
+    while runtime.step_once(timeout=0.0):
+        pass
 
 
-def ready(session):
-    session.state._instance_id = "backend-one"
-    _notify_startup_ready(session, restored=False)
+def emit_ready(runtime, session_id="session-one", instance_id="backend-one"):
+    runtime.session.state._session_id = session_id
+    runtime.session.state._instance_id = instance_id
+    runtime.post(SessionReady(session_id=session_id, instance_id=instance_id, restored=False))
+    drain(runtime)
 
 
-def test_import_registration_and_normal_call_are_side_effect_free(monkeypatch):
+def test_import_registration_and_normal_render_are_side_effect_free(monkeypatch):
     before = dict(os.environ)
 
     def forbidden(*args, **kwargs):
-        pytest.fail("process launched during import, registration, initialization or normal call")
+        pytest.fail("process launched during import, registration, initialization or render")
 
     monkeypatch.setattr(subprocess, "Popen", forbidden)
     plugin = load_plugin()
-    with Session() as session:
-        cfg = config()
-        original = copy.deepcopy(cfg)
-        handler = component(plugin, session, cfg)
+    cfg = config()
+    original = copy.deepcopy(cfg)
+    session, runtime, handler = build_runtime(plugin, cfg)
+    with runtime:
         session.ensure_initialized()
         assert getattr(session.state, plugin.STATE_ATTR) is handler.service
-        assert handler(session.state) is session.state
+        session.step(RenderRequested())
         assert handler.service.process is None
         assert cfg == original
         assert dict(os.environ) == before
 
 
-def test_feature_builds_through_real_pipeline_builder(plugin):
-    with Session() as session:
-        builder = PipelineBuilder(session)
-        plugin.register_features(builder, session=session, config=config())
-        session.pipeline = builder.build(suppress_warnings=True)
-        session.ensure_initialized()
-        assert isinstance(getattr(session.state, plugin.STATE_ATTR), plugin.BridgeService)
+def test_feature_builds_through_real_pipeline_builder_and_default_builder(plugin):
+    session = Session()
+    builder = build_default_builder(
+        session, config=config(), include_plugins=False, include_llm_drivers=False,
+    )
+    plugin.register_features(builder, session=session, config=config())
+    session.pipeline = builder.build()
+    session.ensure_initialized()
+    assert isinstance(getattr(session.state, plugin.STATE_ATTR), plugin.BridgeService)
+    drivers = builder.build_drivers()
+    assert any(isinstance(d, plugin.BridgeDriver) for d in drivers)
 
 
 @pytest.mark.parametrize("cfg", [
@@ -185,13 +209,13 @@ def test_disabled_and_other_profiles_do_not_register(plugin, cfg):
     assert cfg == original
 
 
-def test_cold_bind_shares_private_config_before_worker_and_session_exit_cleans(plugin, fake_bridge, monkeypatch):
-    from agents.llm import _normalize_provider_sections
-    from agents.llm_subprocess import LLMProcessSupervisor
+def test_cold_bind_shares_private_config_before_worker_and_runtime_exit_cleans(plugin, fake_bridge, monkeypatch):
+    from agent_zoo.llm.catalog import _normalize_provider_sections
+    from agent_zoo.features.turn.llm_caller import LLMCaller
 
     cfg = config()
     original = copy.deepcopy(cfg)
-    supervisor = LLMProcessSupervisor(cfg)  # root copy before bind: nested registry must stay shared
+    caller = LLMCaller(config=cfg)  # holds reference to original config dict before SessionReady
     calls = []
     popen = subprocess.Popen
 
@@ -200,10 +224,11 @@ def test_cold_bind_shares_private_config_before_worker_and_session_exit_cleans(p
         return popen(*args, **kwargs)
 
     monkeypatch.setattr(plugin.subprocess, "Popen", spy)
-    with Session() as session:
-        handler = component(plugin, session, cfg, fake_bridge())
-        bind(session)
-        ready(session)
+    session, runtime, handler = build_runtime(plugin, cfg, fake_bridge())
+    with runtime:
+        emit_ready(runtime)
+        runtime.post(BeforeLLM())
+        drain(runtime)
         service = handler.service
         proc = service.process
         key, env_name = service._key, service.env_name
@@ -218,11 +243,10 @@ def test_cold_bind_shares_private_config_before_worker_and_session_exit_cleans(p
         assert not proc.stdin.closed
         assert service.endpoint.startswith("http://127.0.0.1:")
         assert int(service.endpoint.rsplit(":", 1)[1]) > 0
-        assert supervisor._proc is None  # manager readiness is not inference
         for name in ("bridge", "bridge-two"):
             provider = cfg["llm"]["models"][name]["anthropic"]
             client = provider["client"]
-            assert supervisor._config["llm"]["models"][name]["anthropic"]["client"] is client
+            assert caller.config["llm"]["models"][name]["anthropic"]["client"] is client
             assert client["base_url"] == service.endpoint
             assert client["api_key_env"] == env_name
             assert client["auth_token"] == "local-bridge-not-anthropic"
@@ -241,25 +265,26 @@ def test_cold_bind_shares_private_config_before_worker_and_session_exit_cleans(p
 
 
 def test_real_session_save_restore_and_state_replacement_keep_same_owner(plugin, fake_bridge, tmp_path):
-    with Session() as session:
-        handler = component(plugin, session, config(), fake_bridge())
-        bind(session)
+    session, runtime, handler = build_runtime(plugin, config(), fake_bridge())
+    with runtime:
+        emit_ready(runtime)
         owner = handler.service
         proc, key = owner.process, owner._key
         path = tmp_path / "session.json"
-        session.save(str(path))
+        save_session_json(session.state, session.pipeline, path)
         saved = json.loads(path.read_text())
         assert saved["components"][plugin.STATE_ATTR] == {"version": 1}
         assert key not in path.read_text()
         assert "owner_pid" not in path.read_text()
-        session.load(str(path))
-        session.ensure_initialized()
+
+        # Restore into the same session state via load_session_json + restore_session_document
+        doc = load_session_json(path)
+        restore_session_document(doc, session.pipeline, state=session.state)
         assert getattr(session.state, plugin.STATE_ATTR) is owner
         assert owner.process is proc and owner._key == key
-        # Exercise the real runtime restore path against a replacement state,
+
+        # Exercise the real runtime restore path against a replacement State,
         # which must obtain this SAME owner from our init factory.
-        from agent_utils.session_repository import StoredState
-        from agent_zoo.session_load import LoadedSession
         loaded = LoadedSession(StoredState(
             repository=tmp_path, journal_path=tmp_path / "source.journal",
             session_id="session-one", instance_id="source", commit_id="commit",
@@ -270,15 +295,19 @@ def test_real_session_save_restore_and_state_replacement_keep_same_owner(plugin,
         assert restore_session_state(session, loaded)
         session.ensure_initialized()
         assert getattr(session.state, plugin.STATE_ATTR) is owner
-        bind(session)
+        emit_ready(runtime, "session-one")
         assert owner.process is proc
+
+        # State replacement with a brand-new session identity
         session.state = State()
         session._initialized = False
         session.ensure_initialized()
         assert getattr(session.state, plugin.STATE_ATTR) is owner
-        bind(session, "session-two")
-        ready(session)
+        emit_ready(runtime, "session-two")
+        runtime.post(BeforeLLM())
+        drain(runtime)
         assert owner.process is proc and proc.poll() is None
+
         owner.restore_state({"version": 1, "pid": 1, "owner_pid": 1, "key": "foreign", "endpoint": "foreign"})
         assert owner.process is proc and owner._key == key
     assert proc.poll() is not None
@@ -294,16 +323,16 @@ def test_restore_never_acquires_foreign_ownership(plugin):
 
 
 def test_two_backends_overwrite_inherited_config_without_adopting_owner(plugin, fake_bridge):
-    with Session() as parent:
-        parent_cfg = config()
-        first = component(plugin, parent, parent_cfg, fake_bridge())
-        bind(parent)
+    parent_cfg = config()
+    _, parent_rt, first = build_runtime(plugin, parent_cfg, fake_bridge())
+    with parent_rt:
+        emit_ready(parent_rt, "parent-session")
         a = first.service
         parent_env, parent_key = a.env_name, a._key
-        with Session() as child:
-            child_cfg = copy.deepcopy(parent_cfg)
-            second = component(plugin, child, child_cfg, fake_bridge())
-            bind(child, "child-session")
+        child_cfg = copy.deepcopy(parent_cfg)
+        _, child_rt, second = build_runtime(plugin, child_cfg, fake_bridge())
+        with child_rt:
+            emit_ready(child_rt, "child-session")
             b = second.service
             assert a.process.pid != b.process.pid
             assert a.endpoint != b.endpoint and a.env_name != b.env_name and a._key != b._key
@@ -315,38 +344,49 @@ def test_two_backends_overwrite_inherited_config_without_adopting_owner(plugin, 
     assert parent_env not in os.environ
 
 
-def test_session_ready_strictly_requires_bound_identity_and_live_manager(plugin, fake_bridge):
-    with Session() as session:
-        handler = component(plugin, session, config(), fake_bridge())
+def test_before_llm_and_session_ready_strictly_require_bound_identity_and_live_manager(plugin, fake_bridge):
+    session, runtime, handler = build_runtime(plugin, config(), fake_bridge())
+    with runtime:
         session.state._session_id = "session-one"
         with pytest.raises(RuntimeError, match="matching bind"):
-            ready(session)
-        bind(session)
-        ready(session)
+            runtime.post(BeforeLLM())
+            drain(runtime)
+
+        emit_ready(runtime, "session-one")
+        runtime.post(BeforeLLM())
+        drain(runtime)
+
         session.state._session_id = "unbound-identity"
         with pytest.raises(RuntimeError, match="matching bind"):
-            ready(session)
-        bind(session, "unbound-identity")
+            runtime.post(BeforeLLM())
+            drain(runtime)
+
+        with pytest.raises(RuntimeError, match="mismatched session identity"):
+            runtime.post(SessionReady(session_id="session-one", instance_id="backend-one"))
+            drain(runtime)
+
+        emit_ready(runtime, "unbound-identity")
         handler.service.process.terminate()
         handler.service.process.wait(timeout=2)
         with pytest.raises(RuntimeError, match="not ready"):
-            ready(session)
-        with pytest.raises(RuntimeError, match="not ready"):
-            bind(session, "unbound-identity")
+            emit_ready(runtime, "unbound-identity")
 
 
 @pytest.mark.parametrize("field,value", [
     ("base_url", "https://foreign.invalid"), ("api_key", "foreign"),
     ("default_headers", {"Authorization": "foreign", "x-azo-session-id": "{session_id}"}),
 ])
-def test_ready_rejects_config_tampering(plugin, fake_bridge, field, value):
-    with Session() as session:
-        cfg = config()
-        component(plugin, session, cfg, fake_bridge())
-        bind(session)
+def test_tampering_rejected_on_before_llm_and_session_ready(plugin, fake_bridge, field, value):
+    cfg = config()
+    _, runtime, _ = build_runtime(plugin, cfg, fake_bridge())
+    with runtime:
+        emit_ready(runtime)
         cfg["llm"]["models"]["bridge"]["anthropic"]["client"][field] = value
         with pytest.raises(RuntimeError, match="configuration changed"):
-            ready(session)
+            runtime.post(BeforeLLM())
+            drain(runtime)
+        with pytest.raises(RuntimeError, match="configuration changed"):
+            emit_ready(runtime)
 
 
 @pytest.mark.parametrize("mode, message", [
@@ -355,11 +395,11 @@ def test_ready_rejects_config_tampering(plugin, fake_bridge, field, value):
 ])
 def test_bounded_bad_startup_retains_state_cleanup_owner(plugin, fake_bridge, mode, message, monkeypatch):
     monkeypatch.setattr(plugin, "STARTUP_TIMEOUT", 0.3)
-    with Session() as session:
-        handler = component(plugin, session, config(), fake_bridge(mode))
+    session, runtime, handler = build_runtime(plugin, config(), fake_bridge(mode))
+    with runtime:
         started = time.monotonic()
         with pytest.raises(RuntimeError, match=message) as error:
-            bind(session)
+            emit_ready(runtime)
         assert time.monotonic() - started < 3
         owner = handler.service
         assert getattr(session.state, plugin.STATE_ATTR) is owner
@@ -368,13 +408,13 @@ def test_bounded_bad_startup_retains_state_cleanup_owner(plugin, fake_bridge, mo
         assert "PRIVATE-" not in str(error.value)
 
 
-def test_config_failure_after_launch_is_cleaned_by_real_session_exit(plugin, fake_bridge):
+def test_config_failure_after_launch_is_cleaned_by_runtime_exit(plugin, fake_bridge):
+    cfg = config()
+    cfg["llm"]["models"]["bridge"]["anthropic"]["client"] = None
+    session, runtime, handler = build_runtime(plugin, cfg, fake_bridge())
     with pytest.raises(AttributeError):
-        with Session() as session:
-            cfg = config()
-            cfg["llm"]["models"]["bridge"]["anthropic"]["client"] = None
-            handler = component(plugin, session, cfg, fake_bridge())
-            bind(session)
+        with runtime:
+            emit_ready(runtime)
     assert getattr(session.state, plugin.STATE_ATTR) is handler.service
     assert handler.service.process.poll() is not None
     assert handler.service.env_name not in os.environ
@@ -389,9 +429,9 @@ def test_cleanup_escalates_only_owned_group_and_is_bounded(plugin, fake_bridge, 
         return killpg(pid, sig)
 
     monkeypatch.setattr(plugin.os, "killpg", spy)
-    with Session() as session:
-        handler = component(plugin, session, config(), fake_bridge("stubborn"))
-        bind(session)
+    _, runtime, handler = build_runtime(plugin, config(), fake_bridge("stubborn"))
+    with runtime:
+        emit_ready(runtime)
         owner = handler.service
         pid = owner.process.pid
         start = time.monotonic()
@@ -404,9 +444,9 @@ def test_cleanup_escalates_only_owned_group_and_is_bounded(plugin, fake_bridge, 
 
 
 def test_inherited_handle_cannot_signal_or_remove_parent_env(plugin, fake_bridge):
-    with Session() as session:
-        handler = component(plugin, session, config(), fake_bridge())
-        bind(session)
+    _, runtime, handler = build_runtime(plugin, config(), fake_bridge())
+    with runtime:
+        emit_ready(runtime)
         owner = handler.service
         actual_owner = owner.owner_pid
         owner.owner_pid += 1  # represents the same object inherited by another PID
@@ -421,9 +461,9 @@ def test_inherited_handle_cannot_signal_or_remove_parent_env(plugin, fake_bridge
 
 
 def test_cleanup_preserves_env_value_it_no_longer_owns(plugin, fake_bridge):
-    with Session() as session:
-        handler = component(plugin, session, config(), fake_bridge())
-        bind(session)
+    _, runtime, handler = build_runtime(plugin, config(), fake_bridge())
+    with runtime:
+        emit_ready(runtime)
         name = handler.service.env_name
         try:
             os.environ[name] = "replacement"
@@ -447,10 +487,10 @@ def test_missing_dependencies_fail_locally_before_popen(plugin, fake_bridge, mon
     root = fake_bridge()
     (root / "node_modules/fixture/package.json").unlink()
     monkeypatch.setattr(plugin.subprocess, "Popen", lambda *a, **kw: pytest.fail("launch before dependency validation"))
-    with Session() as session:
-        handler = component(plugin, session, config(), root)
+    session, runtime, handler = build_runtime(plugin, config(), root)
+    with runtime:
         with pytest.raises(RuntimeError, match="dependencies are missing"):
-            bind(session)
+            emit_ready(runtime)
         assert getattr(session.state, plugin.STATE_ATTR) is handler.service
         assert handler.service.process is None
 
@@ -460,11 +500,32 @@ def test_spawn_failure_retains_cleanup_owner_without_private_environment(plugin,
         raise OSError("cannot execute Node")
 
     monkeypatch.setattr(plugin.subprocess, "Popen", fail)
-    with Session() as session:
-        handler = component(plugin, session, config(), fake_bridge())
+    session, runtime, handler = build_runtime(plugin, config(), fake_bridge())
+    with runtime:
         with pytest.raises(OSError, match="cannot execute Node"):
-            bind(session)
+            emit_ready(runtime)
         owner = handler.service
         assert getattr(session.state, plugin.STATE_ATTR) is owner
         assert owner.process is None and owner._key == ""
         assert owner.env_name not in os.environ
+
+
+def test_before_llm_gated_until_bridge_ready(plugin, fake_bridge):
+    session, runtime, handler = build_runtime(plugin, config(), fake_bridge())
+    session.state._session_id = "session-gate"
+    # Step SessionReady without dispatching to driver yet: op is in-flight & gated
+    effects = session.step(SessionReady(session_id="session-gate", instance_id="inst-1"))
+    assert len(effects) == 1
+    assert isinstance(effects[0].request, plugin.StartBridge)
+    assert handler._pending_op in session.state.llm_gates
+    # BeforeLLM while bridge startup is in-flight stops propagation and records wait
+    before_ev = BeforeLLM()
+    session.step(before_ev)
+    assert before_ev.stopped is True
+    assert handler._waiting_before_llm is True
+    # Clean up via Runtime
+    with runtime:
+        runtime.drivers.dispatch(effects)
+        drain(runtime)
+        assert handler._bound is True
+        assert not session.state.llm_gates
