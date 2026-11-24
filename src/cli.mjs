@@ -8,7 +8,6 @@ const { values } = parseArgs({ options: {
   'key-file': { type: 'string' },
   'idle-seconds': { type: 'string', default: '300' },
   'timeout-seconds': { type: 'string', default: '0' },
-  'max-sessions': { type: 'string', default: '16' },
   'system-prompt-mode': { type: 'string', default: 'append' },
   'interrupt-mode': { type: 'string', default: 'rollback' },
 } });
@@ -16,7 +15,7 @@ if (values.help) {
   console.log('Agent Zoo Claude SDK bridge (opt-in, loopback only)\n' +
     'Usage: pixi run start [--port 8766] [--key-file PATH]\n' +
     'Local key: AZO_CLAUDE_BRIDGE_KEY, minimum 32 characters; never a Claude credential.\n' +
-    'Controls: --idle-seconds 300 --timeout-seconds 0 (no total deadline) --max-sessions 16\n' +
+    'Controls: --idle-seconds 300 --timeout-seconds 0 (no total deadline)\n' +
     'Prompt: --system-prompt-mode append (reference default) or custom\n' +
     'Interruption: --interrupt-mode rollback (default), reuse, or rebuild\n' +
     'Uses the Claude Agent SDK login. Does not enable or change extra-usage settings.');
@@ -31,7 +30,6 @@ if (values.help) {
     const port = integer('port', 1, 65535);
     const idleMs = integer('idle-seconds', 1, 86400) * 1000;
     const requestTimeoutMs = integer('timeout-seconds', 0, 86400) * 1000;
-    const maxSessions = integer('max-sessions', 1, 128);
     const key = values['key-file'] ? (await readFile(values['key-file'], 'utf8')).trim()
       : process.env.AZO_CLAUDE_BRIDGE_KEY;
     if (typeof key !== 'string' || key.length < 32) throw new Error('Missing key');
@@ -39,7 +37,7 @@ if (values.help) {
     const systemPromptMode = values['system-prompt-mode'];
     if (!['append', 'custom'].includes(systemPromptMode)) throw new Error('Invalid prompt mode');
     const interruptMode = values['interrupt-mode'];
-    const manager = new BridgeManager({ idleMs, requestTimeoutMs, maxSessions, systemPromptMode, interruptMode });
+    const manager = new BridgeManager({ idleMs, requestTimeoutMs, systemPromptMode, interruptMode });
     endpoint = createBridgeServer({ manager, key, requestTimeoutMs });
     const address = await endpoint.listen(port);
     console.log(JSON.stringify({ kind: 'listening', host: address.address, port: address.port,

@@ -367,14 +367,11 @@ test('registered name mismatches cannot claim queued results', async (t) => {
   assert.equal((await call('a')).content[0].text, 'right tool');
 });
 
-test('per-query call ledger is bounded and over-limit batches register nothing', () => {
+test('per-query call ledger has no arbitrary session-length call cap and clears on close', () => {
   const bridge = new ToolBridge([tool()]);
-  const calls = Array.from({ length: 4096 }, (_, index) => use(`id-${index}`));
-  bad(() => bridge.expect([...calls, use('over-limit')]), /call limits/);
-  assert.equal(bridge.pendingIds.size, 0);
+  const calls = Array.from({ length: 4200 }, (_, index) => use(`id-${index}`));
   bridge.expect(calls);
-  bad(() => bridge.expect([use('over-limit')]), /call limits/);
-  assert.equal(bridge.pendingIds.size, 4096);
+  assert.equal(bridge.pendingIds.size, 4200);
   bridge.close();
   assert.equal(bridge.pendingIds.size, 0);
 });
@@ -383,4 +380,61 @@ test('root schema combinators fail explicitly rather than disappearing in Claude
   for (const key of ['anyOf', 'oneOf', 'allOf']) {
     bad(() => new ToolBridge([{ ...tool(), input_schema: { ...schema, [key]: [{ required: ['value'] }] } }]), /Top-level/);
   }
+});
+
+test('CLI schema-coerced callback arguments match model tool_use in both arrival orders while genuine mismatches still fail', async (t) => {
+  const coercedTool = {
+    name: 'terminal_run',
+    description: 'Run shell command',
+    input_schema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string' },
+        pane_index: { type: ['integer', 'null'] },
+        keep_alive: { type: 'boolean' },
+        tags: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['command'],
+    },
+  };
+  const { bridge, call } = await fixture(t, [coercedTool]);
+
+  // Early callback (CLI coerced "37" -> 37 and "true" -> true) before expect()
+  const early = call('early-coerced', '', 'terminal_run', {
+    arguments: { command: 'pwd', pane_index: 37, keep_alive: true, tags: ['a', 'b'] },
+  });
+  await setImmediate();
+  bridge.expect([{
+    type: 'tool_use',
+    id: 'early-coerced',
+    name: 'terminal_run',
+    input: { command: 'pwd', pane_index: '37', keep_alive: 'true', tags: '["a","b"]' },
+  }]);
+  bridge.deliver([result('early-coerced', 'coerced-ok')]);
+  assert.equal((await early).content[0].text, 'coerced-ok');
+
+  // expect() before callback
+  bridge.expect([{
+    type: 'tool_use',
+    id: 'late-coerced',
+    name: 'terminal_run',
+    input: { command: 'ls', pane_index: '42', keep_alive: 'false' },
+  }]);
+  bridge.deliver([result('late-coerced', 'late-ok')]);
+  const late = await call('late-coerced', '', 'terminal_run', {
+    arguments: { command: 'ls', pane_index: 42, keep_alive: false },
+  });
+  assert.equal(late.content[0].text, 'late-ok');
+
+  // Genuine mismatch (different number or coercing a string-typed field) must still fail
+  bridge.expect([{
+    type: 'tool_use',
+    id: 'mismatch-num',
+    name: 'terminal_run',
+    input: { command: 'pwd', pane_index: '37' },
+  }]);
+  await assert.rejects(
+    call('mismatch-num', '', 'terminal_run', { arguments: { command: 'pwd', pane_index: 38 } }),
+    /does not match/,
+  );
 });

@@ -5,7 +5,6 @@ import { validateSchemaCompatibility } from './request.mjs';
 
 const SDK_PREFIX = 'mcp__azo__';
 const ID_META = 'claudecode/toolUseId';
-const MAX_CALLS = 4096;
 const MAX_JSON_BYTES = 8 * 1024 * 1024;
 const MAX_QUEUED_BYTES = 32 * 1024 * 1024;
 
@@ -62,9 +61,66 @@ function id(value) {
     && !/[\x00-\x20\x7f]/u.test(value), 'Invalid tool-use ID.');
   return value;
 }
-function argumentsKey(value) {
+function argumentsSnapshot(value) {
   assert(record(value), 'Tool arguments must be a JSON object.');
-  return snapshot(value).key;
+  return snapshot(value);
+}
+function schemaTypes(schema) {
+  const types = new Set();
+  if (!record(schema)) return types;
+  if (typeof schema.type === 'string') types.add(schema.type);
+  else if (Array.isArray(schema.type)) {
+    for (const item of schema.type) if (typeof item === 'string') types.add(item);
+  }
+  for (const branchKey of ['anyOf', 'oneOf']) {
+    if (Array.isArray(schema[branchKey])) {
+      for (const branch of schema[branchKey]) {
+        for (const t of schemaTypes(branch)) types.add(t);
+      }
+    }
+  }
+  return types;
+}
+function matchesCoerced(modelVal, callbackVal, schema) {
+  if (modelVal === callbackVal) return true;
+  if (typeof modelVal === 'string') {
+    const types = schemaTypes(schema);
+    if (typeof callbackVal === 'number' && (types.has('integer') || types.has('number'))) {
+      if (modelVal.trim() === '' || Number(modelVal) !== callbackVal) return false;
+      return types.has('number') || Number.isInteger(callbackVal);
+    }
+    if (typeof callbackVal === 'boolean' && types.has('boolean')) {
+      return (modelVal === 'true' && callbackVal === true) || (modelVal === 'false' && callbackVal === false);
+    }
+    if ((Array.isArray(callbackVal) && types.has('array')) || (record(callbackVal) && types.has('object'))) {
+      try {
+        const parsed = JSON.parse(modelVal);
+        return snapshot(parsed).key === snapshot(callbackVal).key;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+  if (Array.isArray(modelVal) && Array.isArray(callbackVal)) {
+    if (modelVal.length !== callbackVal.length) return false;
+    const itemSchema = record(schema?.items) ? schema.items : undefined;
+    return modelVal.every((item, idx) => matchesCoerced(item, callbackVal[idx], itemSchema));
+  }
+  if (record(modelVal) && record(callbackVal)) {
+    const modelKeys = Object.keys(modelVal);
+    const cbKeys = Object.keys(callbackVal);
+    if (modelKeys.length !== cbKeys.length) return false;
+    const props = record(schema?.properties) ? schema.properties : undefined;
+    const extra = record(schema?.additionalProperties) ? schema.additionalProperties : undefined;
+    for (const key of modelKeys) {
+      if (!Object.hasOwn(callbackVal, key)) return false;
+      const propSchema = props && Object.hasOwn(props, key) ? props[key] : extra;
+      if (!matchesCoerced(modelVal[key], callbackVal[key], propSchema)) return false;
+    }
+    return true;
+  }
+  return false;
 }
 function onlyKeys(value, allowed) {
   assert(Object.keys(value).every((key) => allowed.includes(key)), 'Unsupported tool-result fields.');
@@ -105,6 +161,7 @@ function resultContent(content) {
 export class ToolBridge {
   #hostNames = new Map();
   #sdkNames = new Map();
+  #schemas = new Map();
   #calls = new Map();
   #pending = new Set();
   #queuedBytes = 0;
@@ -112,7 +169,7 @@ export class ToolBridge {
   #server;
 
   constructor(tools) {
-    assert(Array.isArray(tools) && tools.length <= MAX_CALLS, 'Tools must be a bounded array.');
+    assert(Array.isArray(tools), 'Tools must be an array.');
     const definitions = tools.map((tool) => {
       assert(record(tool), 'Invalid tool definition.');
       // cache_control is a transport hint, not tool behavior; all other unknown
@@ -137,6 +194,7 @@ export class ToolBridge {
       assert(!this.#sdkNames.has(sdkName), 'Tool-name alias collision.');
       this.#hostNames.set(name, sdkName);
       this.#sdkNames.set(sdkName, name);
+      this.#schemas.set(name, schema);
       const clarification = `Host tool name: ${JSON.stringify(name)}.`;
       const description = hashed
         ? (tool.description === undefined ? clarification : `${tool.description}\n\n${clarification}`)
@@ -165,8 +223,10 @@ export class ToolBridge {
     return this.#sdkNames.get(sdkName);
   }
   #assertOpen() { assert(!this.#closed, 'Tool bridge is closed.'); }
-  #matches(entry, name, key) {
-    assert(entry.name === name && entry.argumentsKey === key, 'Tool callback does not match the model tool use.');
+  #matches(name, modelArgs, modelKey, callbackArgs, callbackKey) {
+    const schema = this.#schemas.get(name);
+    const ok = modelKey === callbackKey || matchesCoerced(modelArgs, callbackArgs, schema);
+    assert(ok, `Tool callback for ${toolLabel(name)} does not match the model tool use.`);
   }
 
   expect(contentBlocks) {
@@ -178,15 +238,17 @@ export class ToolBridge {
       if (block.type !== 'tool_use') continue;
       const callId = id(block.id);
       this.toSdkName(block.name); // HOST names only, never accept SDK aliases here.
-      const key = argumentsKey(block.input);
+      const snapped = argumentsSnapshot(block.input);
+      const key = snapped.key;
       assert(!staged.has(callId), 'Duplicate tool-use ID in model batch.');
       const previous = this.#calls.get(callId);
       assert(!previous?.expected, 'Model tool-use ID was already registered.');
-      if (previous) this.#matches(previous, block.name, key);
-      staged.set(callId, previous ?? { name: block.name, argumentsKey: key });
+      if (previous) {
+        assert(previous.name === block.name, `Tool callback for ${toolLabel(block.name)} does not match the model tool use.`);
+        this.#matches(block.name, snapped.value, key, previous.args, previous.argumentsKey);
+      }
+      staged.set(callId, previous ?? { name: block.name, args: snapped.value, argumentsKey: key });
     }
-    const additions = [...staged.keys()].filter((key) => !this.#calls.has(key)).length;
-    assert(this.#calls.size + additions <= MAX_CALLS, 'Tool query exceeds call limits.');
     // No state was changed above: malformed batches cannot publish a partial set.
     for (const [callId, entry] of staged) {
       entry.expected = true;
@@ -238,14 +300,15 @@ export class ToolBridge {
     const name = this.fromSdkName(SDK_PREFIX + params.name);
     // Deliberately NO fallback by name, arrival order, or request JSON-RPC ID.
     const callId = id(params._meta?.[ID_META]);
-    const key = argumentsKey(params.arguments);
+    const snapped = argumentsSnapshot(params.arguments);
+    const key = snapped.key;
     let entry = this.#calls.get(callId);
     if (entry) {
-      this.#matches(entry, name, key);
+      assert(entry.name === name, `Tool callback for ${toolLabel(name)} does not match the model tool use.`);
+      this.#matches(name, entry.args, entry.argumentsKey, snapped.value, key);
       assert(!entry.callbackSeen, 'Duplicate SDK tool callback.');
     } else {
-      assert(this.#calls.size < MAX_CALLS, 'Tool query exceeds call limits.');
-      entry = { name, argumentsKey: key };
+      entry = { name, args: snapped.value, argumentsKey: key };
       this.#calls.set(callId, entry);
     }
     entry.callbackSeen = true;

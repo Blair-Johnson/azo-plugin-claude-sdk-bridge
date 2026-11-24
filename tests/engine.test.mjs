@@ -267,12 +267,11 @@ test('SDK exhaustion triggers a clean full-history rebuild on the next turn', as
   assert.equal(f.queries[1].options.cwd, f.queries[0].options.cwd);
 });
 
-test('per-session lock, capacity, and idle expiry are enforced', async t => {
-  const f = await fixture(t, () => {}, { maxSessions: 1 });
+test('per-session lock and idle expiry are enforced', async t => {
+  const f = await fixture(t, () => {});
   const pending = f.manager.handle(body(), { sessionId: 'a' });
   await until(() => f.queries.length === 1);
   await assert.rejects(f.manager.handle(body(), { sessionId: 'a' }), { statusCode: 409 });
-  await assert.rejects(f.manager.handle(body(), { sessionId: 'b' }), { statusCode: 503 });
   f.queries[0].respond([{ type: 'text', text: 'done' }]); await pending;
   f.manager.sessions.get('a').touched = Date.now() - f.manager.idleMs - 1;
   await f.manager.sweep(); assert.equal(f.manager.sessions.size, 0); assert.equal(f.queries[0].closed, 1);
@@ -381,7 +380,7 @@ test('late child close releases an expired slot without poisoning unrelated requ
   const f = await fixture(t, q => {
     q.options.spawnClaudeCodeProcess({ command: 'stub', args: [], env: {} });
     q.respond([{ type: 'text', text: 'ok' }]);
-  }, { maxSessions: 2, processFactory: () => new QueryProcess({ graceMs: 2, killMs: 2,
+  }, { processFactory: () => new QueryProcess({ graceMs: 2, killMs: 2,
     spawnFactory: () => {
       const child = new EventEmitter(); child.stderr = new EventEmitter(); child.signals = [];
       child.kill = signal => { child.signals.push(signal); return true; };

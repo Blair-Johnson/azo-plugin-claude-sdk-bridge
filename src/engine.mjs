@@ -241,7 +241,7 @@ export const INTERRUPT_MODES = ['rollback', 'reuse', 'rebuild'];
 /** Agent Zoo owns history and tools. SDK sessions are disposable mirrors only. */
 export class BridgeManager {
   constructor({ queryFactory, stateRoot, idleMs = 300000,
-    requestTimeoutMs = 0, maxSessions = 16, historyImporter = importSession,
+    requestTimeoutMs = 0, historyImporter = importSession,
     processFactory = () => new QueryProcess(), env = process.env, systemPromptMode = 'append',
     interruptMode = 'rollback', interruptTimeoutMs = 500 } = {}) {
     if (!INTERRUPT_MODES.includes(interruptMode)) throw new TypeError('Invalid interrupt mode');
@@ -251,9 +251,9 @@ export class BridgeManager {
     this.interruptTimeoutMs = interruptTimeoutMs;
     if (!['append', 'custom'].includes(systemPromptMode)) throw new TypeError('Invalid system prompt mode');
     this.systemPromptMode = systemPromptMode;
-    if (![idleMs, maxSessions].every(n => Number.isFinite(n) && n > 0)
-        || !Number.isFinite(requestTimeoutMs) || requestTimeoutMs < 0
-        || !Number.isInteger(maxSessions)) throw new TypeError('Invalid bridge resource limits');
+    if (!Number.isFinite(idleMs) || idleMs <= 0
+        || !Number.isFinite(requestTimeoutMs) || requestTimeoutMs < 0)
+      throw new TypeError('Invalid bridge resource limits');
     this.queryFactory = queryFactory ?? (async options => (await import('@anthropic-ai/claude-agent-sdk')).query(options));
     this.historyImporter = historyImporter;
     this.processFactory = processFactory;
@@ -261,7 +261,6 @@ export class BridgeManager {
     this.stateRoot = stateRoot;
     this.idleMs = idleMs;
     this.requestTimeoutMs = requestTimeoutMs;
-    this.maxSessions = maxSessions;
     this.sessions = new Map();
     this.closing = false;
     this.sweepTimer = setInterval(() => { this.sweep().catch(() => {}); }, Math.max(10, Math.min(idleMs, 10000)));
@@ -303,7 +302,6 @@ export class BridgeManager {
     if (signal?.aborted) throw new BridgeError(499, 'The request was cancelled.');
     if (slot?.busy) throw new BridgeError(409, 'A request is already active for this session.');
     if (!slot) {
-      if (this.sessions.size >= this.maxSessions) throw new BridgeError(503, 'The bridge session capacity is full.');
       slot = { key, busy: false, session: null, cwd: null, current: null, touched: Date.now(), closing: false };
       this.sessions.set(key, slot);
     }
