@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import json
 import os
@@ -11,20 +12,30 @@ import select
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from typing import Any
 
-from agent_utils.core.events import BeforeLLM, Event, IoCompleted, IoFailed
+from agent_utils.core.events import (
+    BeforeLLM,
+    Event,
+    IoCompleted,
+    IoFailed,
+    IoInterrupted,
+    SessionRestored,
+)
 from agent_utils.core.io import IoRequest, OpId
 from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import State
 from agent_utils.features.core import IoFence
 from agent_utils.runtime.driver import Driver
+from agent_zoo.core.feature_state import session_state
 from agent_zoo.events import SessionReady
 from agent_zoo.features.turn.llm_caller import LLMCaller
 
 
-STATE_ATTR = "claude_sdk_bridge_service"
+RUNTIME_KEY = "claude_sdk_bridge"
+READINESS_KEY = "claude_sdk_bridge"
 STARTUP_TIMEOUT = 10.0
 SHUTDOWN_TIMEOUT = 1.0
 GRACEFUL_SHUTDOWN_TIMEOUT = 6.0
@@ -45,8 +56,26 @@ class ValidateBridge(IoRequest):
     session_id: str = ""
 
 
+@dataclass
+class BridgeRuntimeState:
+    """Ephemeral per-session bridge binding state stored under ``state.runtime(...)``."""
+
+    session_id: str = ""
+    endpoint: str = ""
+    env_name: str = ""
+    pending_op: OpId | None = None
+    waiting_before_llm: bool = False
+    bound: bool = False
+    last_error: BaseException | None = None
+
+
+def bridge_runtime(state: State) -> BridgeRuntimeState:
+    """Return the ephemeral per-session ``BridgeRuntimeState``."""
+    return state.runtime(RUNTIME_KEY, BridgeRuntimeState)
+
+
 class BridgeService:
-    """Ephemeral ownership: never recover a process or credential from a save."""
+    """Private process-bound bridge owner managed exclusively by ``BridgeDriver``."""
 
     def __init__(self, root: str | Path | None = None) -> None:
         self.root = Path(root) if root is not None else Path(__file__).resolve().parents[1]
@@ -56,14 +85,14 @@ class BridgeService:
         self.env_name = ""
         self._key = ""
         self._closed = False
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
 
-    def save_state(self) -> dict[str, int]:
-        return {"version": 1}
-
-    def restore_state(self, saved: Any) -> None:
-        # Initialization supplies this backend's SAME owner. Saved PID/port/key
-        # fields, including those in old or foreign snapshots, are not trusted.
-        del saved
+    def request_stop(self) -> None:
+        """Wake any in-progress readiness wait so ``cleanup()`` can proceed promptly."""
+        if self.owner_pid is not None and self.owner_pid != os.getpid():
+            return
+        self._stop_event.set()
 
     def _command(self) -> list[str]:
         local_node = self.root / ".pixi/envs/default/bin/node"
@@ -80,39 +109,41 @@ class BridgeService:
             raise RuntimeError("Claude SDK bridge dependencies are missing; install them before starting the backend.")
         return [node, str(script)]
 
-    def start(self) -> None:
-        if self._closed:
-            raise RuntimeError("Claude SDK bridge owner is already closed.")
-        if self.process is not None:
-            self.validate()
-            return
-        command = self._command()
-        self.owner_pid = os.getpid()
-        self._key = secrets.token_hex(32)
-        self.env_name = "AZO_CLAUDE_BRIDGE_LOCAL_" + secrets.token_hex(16).upper()
-        try:
-            # No credentials in argv, logs, or durable state. The open stdin is
-            # also the manager's parent-death lifeline. Never launch via a shell.
-            self.process = subprocess.Popen(
-                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, start_new_session=True, bufsize=0,
-            )
-            assert self.process.stdin is not None
-            self.process.stdin.write(
-                (json.dumps({"version": 1, "key": self._key, "port": 0, "ownedProcessGroup": True}) + "\n").encode()
-            )
-            ready = self._read_ready()
-            if (not isinstance(ready, dict) or ready.get("kind") != "ready"
-                    or type(ready.get("version")) is not int or ready["version"] != 1
-                    or type(ready.get("pid")) is not int or ready["pid"] != self.process.pid
-                    or type(ready.get("port")) is not int or not 0 < ready["port"] < 65536):
-                raise RuntimeError("Claude SDK bridge returned an invalid readiness handshake.")
-            self.endpoint = f"http://127.0.0.1:{ready['port']}"
-            os.environ[self.env_name] = self._key
-            self.validate()
-        except BaseException:
-            self.cleanup()
-            raise
+    def start(self) -> tuple[str, str]:
+        with self._lock:
+            if self._closed or self._stop_event.is_set():
+                raise RuntimeError("Claude SDK bridge owner is already closed.")
+            if self.process is not None:
+                self.validate()
+                return self.endpoint, self.env_name
+            command = self._command()
+            self.owner_pid = os.getpid()
+            self._key = secrets.token_hex(32)
+            self.env_name = "AZO_CLAUDE_BRIDGE_LOCAL_" + secrets.token_hex(16).upper()
+            try:
+                # No credentials in argv, logs, or durable state. The open stdin is
+                # also the manager's parent-death lifeline. Never launch via a shell.
+                self.process = subprocess.Popen(
+                    command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, start_new_session=True, bufsize=0,
+                )
+                assert self.process.stdin is not None
+                self.process.stdin.write(
+                    (json.dumps({"version": 1, "key": self._key, "port": 0, "ownedProcessGroup": True}) + "\n").encode()
+                )
+                ready = self._read_ready()
+                if (not isinstance(ready, dict) or ready.get("kind") != "ready"
+                        or type(ready.get("version")) is not int or ready["version"] != 1
+                        or type(ready.get("pid")) is not int or ready["pid"] != self.process.pid
+                        or type(ready.get("port")) is not int or not 0 < ready["port"] < 65536):
+                    raise RuntimeError("Claude SDK bridge returned an invalid readiness handshake.")
+                self.endpoint = f"http://127.0.0.1:{ready['port']}"
+                os.environ[self.env_name] = self._key
+                self.validate()
+                return self.endpoint, self.env_name
+            except BaseException:
+                self.cleanup()
+                raise
 
     def _read_ready(self) -> Any:
         assert self.process is not None and self.process.stdout is not None
@@ -120,9 +151,14 @@ class BridgeService:
         data = bytearray()
         fd = self.process.stdout.fileno()
         while b"\n" not in data:
+            if self._stop_event.is_set():
+                raise RuntimeError("Claude SDK bridge startup cancelled.")
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or not select.select([fd], [], [], max(0, remaining))[0]:
+            if remaining <= 0:
                 raise RuntimeError("Claude SDK bridge startup timed out.")
+            ready_fds, _, _ = select.select([fd], [], [], min(0.05, max(0.0, remaining)))
+            if not ready_fds:
+                continue
             chunk = os.read(fd, 4096)
             if not chunk:
                 raise RuntimeError("Claude SDK bridge exited before readiness.")
@@ -135,11 +171,13 @@ class BridgeService:
             # Do not echo child output: it could contain private material.
             raise RuntimeError("Claude SDK bridge returned an invalid readiness handshake.") from None
 
-    def validate(self) -> None:
-        if (self._closed or self.owner_pid != os.getpid() or self.process is None
-                or self.process.poll() is not None or not self.endpoint
-                or not self._key or os.environ.get(self.env_name) != self._key):
-            raise RuntimeError("Claude SDK bridge is not ready in this backend; restart the backend.")
+    def validate(self) -> tuple[str, str]:
+        with self._lock:
+            if (self._closed or self.owner_pid != os.getpid() or self.process is None
+                    or self.process.poll() is not None or not self.endpoint
+                    or not self._key or os.environ.get(self.env_name) != self._key):
+                raise RuntimeError("Claude SDK bridge is not ready in this backend; restart the backend.")
+            return self.endpoint, self.env_name
 
     def _signal_group(self, sig: int) -> None:
         proc = self.process
@@ -156,61 +194,152 @@ class BridgeService:
     def cleanup(self) -> None:
         if self.owner_pid is not None and self.owner_pid != os.getpid():
             return
-        self._closed = True
-        proc = self.process
-        try:
-            if proc is not None:
-                if proc.stdin is not None and not proc.stdin.closed:
-                    proc.stdin.close()
-                for sig in (None, signal.SIGTERM, signal.SIGKILL):
-                    if sig is not None:
-                        self._signal_group(sig)
-                    try:
-                        proc.wait(timeout=GRACEFUL_SHUTDOWN_TIMEOUT if sig is None else SHUTDOWN_TIMEOUT)
-                        break
-                    except subprocess.TimeoutExpired:
-                        continue
-        finally:
-            if proc is not None and proc.stdout is not None:
-                proc.stdout.close()
-            if self.env_name and self._key and os.environ.get(self.env_name) == self._key:
-                os.environ.pop(self.env_name, None)
-            self._key = ""
-            self.endpoint = ""
+        self._stop_event.set()
+        with self._lock:
+            if self.owner_pid is not None and self.owner_pid != os.getpid():
+                return
+            self._closed = True
+            proc = self.process
+            try:
+                if proc is not None:
+                    if proc.stdin is not None and not proc.stdin.closed:
+                        proc.stdin.close()
+                    for sig in (None, signal.SIGTERM, signal.SIGKILL):
+                        if sig is not None:
+                            self._signal_group(sig)
+                        try:
+                            proc.wait(timeout=GRACEFUL_SHUTDOWN_TIMEOUT if sig is None else SHUTDOWN_TIMEOUT)
+                            break
+                        except subprocess.TimeoutExpired:
+                            continue
+            finally:
+                if proc is not None and proc.stdout is not None:
+                    proc.stdout.close()
+                if self.env_name and self._key and os.environ.get(self.env_name) == self._key:
+                    os.environ.pop(self.env_name, None)
+                self._key = ""
+                self.endpoint = ""
 
 
 class BridgeDriver(Driver):
-    """Runtime IO driver owning the ``BridgeService`` subprocess lifecycle."""
+    """Non-blocking process-bound IO driver privately owning ``BridgeService``."""
 
+    durability = "process_bound"
     request_types = (StartBridge, ValidateBridge)
 
-    def __init__(self, service: BridgeService) -> None:
+    def __init__(self, *, root: str | Path | None = None) -> None:
         super().__init__()
-        self.service = service
+        self._service = BridgeService(root)
+        self._lock = threading.RLock()
+        self._executor: ThreadPoolExecutor | None = None
+        self._futures: dict[OpId, Future[Any]] = {}
+        self._cancelled: set[OpId] = set()
+        self._closed = False
+
+    def start(self, emit: EmitFn) -> None:
+        super().start(emit)
+        with self._lock:
+            self._closed = False
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="claude-sdk-bridge",
+                )
 
     def submit(self, op_id: OpId, req: IoRequest) -> None:
+        if not isinstance(req, (StartBridge, ValidateBridge)):
+            raise TypeError(f"Unsupported bridge request: {type(req).__name__}")
+        with self._lock:
+            if self._closed:
+                return
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="claude-sdk-bridge",
+                )
+            fut = self._executor.submit(self._run_op, op_id, req)
+            self._futures[op_id] = fut
+
+    def _run_op(self, op_id: OpId, req: IoRequest) -> None:
+        with self._lock:
+            if self._closed or op_id in self._cancelled:
+                self._futures.pop(op_id, None)
+                self._cancelled.discard(op_id)
+                return
         try:
             if isinstance(req, StartBridge):
-                self.service.start()
+                endpoint, env_name = self._service.start()
             elif isinstance(req, ValidateBridge):
-                self.service.validate()
+                endpoint, env_name = self._service.validate()
             else:
                 raise TypeError(f"Unsupported bridge request: {type(req).__name__}")
         except Exception as exc:
-            self._safe_emit(IoFailed(op_id=op_id, error=exc))
+            with self._lock:
+                self._futures.pop(op_id, None)
+                cancelled = self._closed or op_id in self._cancelled
+                self._cancelled.discard(op_id)
+            if not cancelled:
+                self._safe_emit(IoFailed(op_id=op_id, error=exc))
             return
-        self._safe_emit(
-            IoCompleted(
-                op_id=op_id,
-                value={
-                    "endpoint": self.service.endpoint,
-                    "env_name": self.service.env_name,
-                },
+
+        with self._lock:
+            self._futures.pop(op_id, None)
+            cancelled = self._closed or op_id in self._cancelled
+            self._cancelled.discard(op_id)
+        if not cancelled:
+            self._safe_emit(
+                IoCompleted(
+                    op_id=op_id,
+                    value={"endpoint": endpoint, "env_name": env_name},
+                )
             )
-        )
+
+    def cancel(self, op_id: OpId) -> None:
+        with self._lock:
+            self._cancelled.add(op_id)
+            fut = self._futures.pop(op_id, None)
+        if fut is not None:
+            fut.cancel()
+
+    def quiesce(
+        self,
+        *,
+        policy: str = "terminate",
+        deadline: float | None = None,
+    ) -> list[Event]:
+        del policy, deadline
+        interrupted: list[Event] = []
+        with self._lock:
+            active_items = [
+                (op_id, fut)
+                for op_id, fut in list(self._futures.items())
+                if op_id not in self._cancelled
+            ]
+            for op_id, _fut in active_items:
+                self._cancelled.add(op_id)
+                self._futures.pop(op_id, None)
+                interrupted.append(IoInterrupted(op_id=op_id, reason="shutdown"))
+        for _op_id, fut in active_items:
+            fut.cancel()
+        return interrupted
 
     def close(self) -> None:
-        self.service.cleanup()
+        with self._lock:
+            self._closed = True
+            active_items = list(self._futures.items())
+            for op_id, _fut in active_items:
+                self._cancelled.add(op_id)
+            self._futures.clear()
+            executor = self._executor
+            self._executor = None
+        for _op_id, fut in active_items:
+            fut.cancel()
+        self._service.request_stop()
+        try:
+            self._service.cleanup()
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
 
 
 def _clean_headers(headers: dict[str, Any] | None) -> dict[str, Any]:
@@ -220,30 +349,18 @@ def _clean_headers(headers: dict[str, Any] | None) -> dict[str, Any]:
 class ManagedBridge:
     """Pure Sans-I/O pipeline component binding bridge-tagged LLM profiles."""
 
-    handles = (SessionReady, BeforeLLM, IoCompleted, IoFailed)
-    writes = {STATE_ATTR}
-    optional_reads = {STATE_ATTR, "_session_id", "llm_gates"}
+    handles = (SessionReady, SessionRestored, BeforeLLM, IoCompleted, IoFailed, IoInterrupted)
+    reads: set[str] = set()
+    writes: set[str] = set()
+    optional_reads: set[str] = set()
 
     def __init__(
         self,
-        session: Any,
         config: dict[str, Any],
         profiles: list[str],
-        *,
-        service: BridgeService | None = None,
     ) -> None:
-        self.session = session
         self.config = config
         self.profiles = list(profiles)
-        self.service = service if service is not None else BridgeService()
-        self.session_id = ""
-        self.endpoint = ""
-        self.env_name = ""
-        self._pending_op: OpId | None = None
-        self._waiting_before_llm = False
-        self._bound = False
-        self._last_error: BaseException | None = None
-        self.init = {STATE_ATTR: lambda: self.service}
 
     def _clients(self):
         # enabled_llm_models returns copies. Always edit the original registry:
@@ -271,130 +388,126 @@ class ManagedBridge:
             if "extra_headers" in request:
                 request["extra_headers"] = _clean_headers(request["extra_headers"])
 
-    def verify_config(self) -> None:
+    def verify_config(self, rt: BridgeRuntimeState) -> None:
         for provider, client in self._clients():
             headers = client.get("default_headers", {})
             expected_headers = {**_clean_headers(headers), "x-azo-session-id": "{session_id}"}
             request = provider.get("request", {})
-            if (client.get("base_url") != self.endpoint
-                    or client.get("api_key_env") != self.env_name
+            if (client.get("base_url") != rt.endpoint
+                    or client.get("api_key_env") != rt.env_name
                     or client.get("auth_token") != "local-bridge-not-anthropic"
                     or any(key in client for key in ("api_key", "base_url_env", "auth_token_env", "default_headers_env"))
                     or headers != expected_headers or "extra_headers_env" in request
                     or request.get("extra_headers", {}) != _clean_headers(request.get("extra_headers"))):
                 raise RuntimeError("Claude SDK bridge runtime configuration changed after binding.")
 
-    @staticmethod
-    def _add_gate(state: State, op_id: OpId) -> None:
-        gates = getattr(state, "llm_gates", None)
-        if isinstance(gates, set):
-            gates.add(op_id)
-        else:
-            state.llm_gates = {op_id}
-
-    @staticmethod
-    def _clear_gate(state: State, op_id: OpId) -> None:
-        gates = getattr(state, "llm_gates", None)
-        if isinstance(gates, set):
-            gates.discard(op_id)
-
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
-        if isinstance(event, SessionReady):
-            self._handle_session_ready(event, state)
+        if isinstance(event, (SessionReady, SessionRestored)):
+            self._handle_session_lifecycle(event, state)
         elif isinstance(event, IoCompleted):
             self._handle_io_completed(event, state, emit)
         elif isinstance(event, IoFailed):
             self._handle_io_failed(event, state)
+        elif isinstance(event, IoInterrupted):
+            self._handle_io_interrupted(event, state)
         elif isinstance(event, BeforeLLM):
             self._handle_before_llm(event, state)
 
-    def _handle_session_ready(self, event: SessionReady, state: State) -> None:
-        # Always bind the process-local owner onto State before submitting work,
-        # including after state replacement or checkpoint restoration.
-        setattr(state, STATE_ATTR, self.service)
-        state_sid = str(getattr(state, "_session_id", "") or "").strip()
-        event_sid = str(event.session_id or "").strip()
+    def _handle_session_lifecycle(self, event: SessionReady | SessionRestored, state: State) -> None:
+        rt = bridge_runtime(state)
+        smeta = session_state(state)
+        state_sid = str(smeta.session_id or "").strip()
+        event_sid = str(getattr(event, "session_id", "") or "").strip()
         session_id = event_sid or state_sid
         if not session_id:
             raise RuntimeError("Claude SDK bridge requires a bound session identity.")
         if event_sid and state_sid and event_sid != state_sid:
             raise RuntimeError("Claude SDK bridge SessionReady arrived with mismatched session identity.")
         if not state_sid:
-            state._session_id = session_id
+            smeta.session_id = session_id
 
-        if self._bound:
-            self.verify_config()
+        if rt.bound:
+            self.verify_config(rt)
 
-        if self._pending_op is not None:
-            self._clear_gate(state, self._pending_op)
-            state.io.cancel(self._pending_op)
-            self._pending_op = None
+        if rt.pending_op is not None:
+            state.io.cancel(rt.pending_op)
+            rt.pending_op = None
 
-        self.session_id = session_id
-        self._last_error = None
-        op_id = state.io.submit(StartBridge(session_id=session_id), tag="claude_sdk_bridge")
-        self._pending_op = op_id
-        self._add_gate(state, op_id)
+        rt.session_id = session_id
+        rt.last_error = None
+        op_id = state.io.submit(StartBridge(session_id=session_id), tag=RUNTIME_KEY)
+        rt.pending_op = op_id
+        state.readiness.hold(READINESS_KEY, "Starting Claude SDK bridge")
 
     def _handle_io_completed(self, event: IoCompleted, state: State, emit: EmitFn) -> None:
-        if self._pending_op is None or event.op_id != self._pending_op:
+        rt = bridge_runtime(state)
+        if rt.pending_op is None or event.op_id != rt.pending_op:
             return
-        self._pending_op = None
-        self._clear_gate(state, event.op_id)
+        rt.pending_op = None
+        state.readiness.release(READINESS_KEY)
 
         payload = event.value if isinstance(event.value, dict) else {}
         endpoint = str(payload.get("endpoint") or "")
         env_name = str(payload.get("env_name") or "")
         if not endpoint or not env_name:
             err = RuntimeError("Claude SDK bridge driver returned an incomplete binding.")
-            self._last_error = err
+            rt.last_error = err
             raise err
 
-        if not self._bound:
+        if not rt.bound:
             self._apply_binding(endpoint, env_name)
-            self.endpoint = endpoint
-            self.env_name = env_name
-            self._bound = True
+            rt.endpoint = endpoint
+            rt.env_name = env_name
+            rt.bound = True
         else:
-            if (endpoint, env_name) != (self.endpoint, self.env_name):
+            if (endpoint, env_name) != (rt.endpoint, rt.env_name):
                 self._apply_binding(endpoint, env_name)
-                self.endpoint = endpoint
-                self.env_name = env_name
-            self.verify_config()
+                rt.endpoint = endpoint
+                rt.env_name = env_name
+            self.verify_config(rt)
 
-        if self._waiting_before_llm:
-            self._waiting_before_llm = False
-            if not getattr(state, "llm_gates", None):
+        if rt.waiting_before_llm:
+            rt.waiting_before_llm = False
+            if state.readiness.is_ready:
                 emit(BeforeLLM())
 
     def _handle_io_failed(self, event: IoFailed, state: State) -> None:
-        if self._pending_op is None or event.op_id != self._pending_op:
+        rt = bridge_runtime(state)
+        if rt.pending_op is None or event.op_id != rt.pending_op:
             return
-        self._pending_op = None
-        self._clear_gate(state, event.op_id)
-        self._bound = False
-        self._waiting_before_llm = False
+        rt.pending_op = None
+        state.readiness.release(READINESS_KEY)
+        rt.bound = False
+        rt.waiting_before_llm = False
         err = event.error if isinstance(event.error, BaseException) else RuntimeError(str(event.error))
-        self._last_error = err
+        rt.last_error = err
         raise err
 
+    def _handle_io_interrupted(self, event: IoInterrupted, state: State) -> None:
+        rt = bridge_runtime(state)
+        if rt.pending_op is None or event.op_id != rt.pending_op:
+            return
+        rt.pending_op = None
+        state.readiness.release(READINESS_KEY)
+        rt.bound = False
+        rt.waiting_before_llm = False
+
     def _handle_before_llm(self, event: BeforeLLM, state: State) -> None:
-        if self._pending_op is not None:
-            self._waiting_before_llm = True
+        rt = bridge_runtime(state)
+        if rt.pending_op is not None:
+            rt.waiting_before_llm = True
             event.stop()
             return
-        if self._last_error is not None:
-            raise self._last_error
-        if (state is not self.session.state
-                or getattr(state, STATE_ATTR, None) is not self.service
-                or not self._bound
-                or not self.session_id
-                or getattr(state, "_session_id", "") != self.session_id):
+        if rt.last_error is not None:
+            raise rt.last_error
+        current_sid = str(session_state(state).session_id or "").strip()
+        if not rt.bound or not rt.session_id or current_sid != rt.session_id:
             raise RuntimeError("Claude SDK bridge BeforeLLM arrived without a matching bind.")
-        self.verify_config()
+        self.verify_config(rt)
 
 
-def register_features(builder, *, session, config):
+def register_features(builder: Any, *, session: Any, config: dict[str, Any]) -> None:
+    del session
     from agent_zoo.llm import enabled_llm_models
 
     # Missing registry is normal in inspector/minimal configurations.
@@ -407,14 +520,11 @@ def register_features(builder, *, session, config):
         if "sdk-bridge" in tags or entry.get("tag") == "sdk-bridge":
             profiles.append(name)
     if profiles:
-        service = BridgeService()
-        bridge = ManagedBridge(session, config, profiles, service=service)
-        driver = BridgeDriver(service)
         builder.add(
             Feature(
                 name="claude_sdk_bridge",
-                components=[bridge],
+                components=[ManagedBridge(config, profiles)],
                 order=[IoFence, ManagedBridge, LLMCaller],
-                drivers=[driver],
+                drivers=[BridgeDriver],
             )
         )
