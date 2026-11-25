@@ -442,3 +442,85 @@ def register_features(builder: Any, *, config: dict[str, Any]) -> None:
                 drivers=[BridgeDriver],
             )
         )
+
+
+# ---------------------------------------------------------------------------
+# Deterministic Simulation Testing (DST) Hooks
+# ---------------------------------------------------------------------------
+
+
+def register_sim_handlers(sim: Any, rng: Any) -> None:
+    """Register deterministic in-memory simulation handlers for bridge startup/validation."""
+    from agent_utils.runtime.simulation import SimOutcome
+
+    bridge_state: dict[str, Any] = {"started": False, "endpoint": "", "env_name": ""}
+
+    def _handle_start_bridge(_op_id: OpId, _req: StartBridge, _sim: Any) -> SimOutcome:
+        if not bridge_state["started"]:
+            port = rng.randint(40000, 59999)
+            token = f"{rng.randrange(1 << 64):016X}"
+            bridge_state["endpoint"] = f"http://127.0.0.1:{port}"
+            bridge_state["env_name"] = f"AZO_CLAUDE_BRIDGE_SIM_{token}"
+            bridge_state["started"] = True
+        return SimOutcome(
+            value={
+                "endpoint": bridge_state["endpoint"],
+                "env_name": bridge_state["env_name"],
+            },
+            delay=rng.uniform(0.01, 0.05),
+        )
+
+    def _handle_validate_bridge(_op_id: OpId, _req: ValidateBridge, _sim: Any) -> SimOutcome:
+        delay = rng.uniform(0.01, 0.04)
+        if not bridge_state["started"]:
+            return SimOutcome(
+                error=RuntimeError("Claude SDK bridge is not ready in this backend; restart the backend."),
+                delay=delay,
+            )
+        return SimOutcome(
+            value={
+                "endpoint": bridge_state["endpoint"],
+                "env_name": bridge_state["env_name"],
+            },
+            delay=delay,
+        )
+
+    import sys as _sys
+
+    sim.register_handler(StartBridge, _handle_start_bridge)
+    sim.register_handler(ValidateBridge, _handle_validate_bridge)
+    # Also bind classes from the latest loaded module in sys.modules in case
+    # the plugin file was re-imported on a restore/reload phase.
+    live_mod = _sys.modules.get(__name__)
+    for req_name, handler in (("StartBridge", _handle_start_bridge), ("ValidateBridge", _handle_validate_bridge)):
+        cls = getattr(live_mod, req_name, None)
+        if isinstance(cls, type):
+            sim.register_handler(cls, handler)
+
+
+def check_invariants(session: Any) -> None:
+    """Verify structural and ReadinessGate invariants on ``BridgeRuntimeState``."""
+    state = session.state
+    rt = state.runtime(RUNTIME_KEY) if callable(getattr(state, "runtime", None)) else None
+    if not (isinstance(rt, BridgeRuntimeState) or type(rt).__name__ == "BridgeRuntimeState"):
+        return
+    readiness = getattr(state, "readiness", None)
+    holds = getattr(readiness, "holds", None) or {}
+    if rt.pending_op is not None:
+        assert isinstance(rt.pending_op, str) and rt.pending_op
+        assert READINESS_KEY in holds, (
+            f"pending bridge op {rt.pending_op!r} missing readiness hold {READINESS_KEY!r}"
+        )
+    else:
+        assert READINESS_KEY not in holds, (
+            f"dangling readiness hold {READINESS_KEY!r} with no pending bridge op"
+        )
+        assert not rt.waiting_before_llm, (
+            "waiting_before_llm=True with no pending bridge op"
+        )
+    if rt.bound:
+        assert rt.endpoint.startswith("http://127.0.0.1:"), (
+            f"bound bridge has unexpected endpoint: {rt.endpoint!r}"
+        )
+        assert bool(rt.env_name), "bound bridge missing env_name"
+        assert bool(rt.session_id), "bound bridge missing session_id"
