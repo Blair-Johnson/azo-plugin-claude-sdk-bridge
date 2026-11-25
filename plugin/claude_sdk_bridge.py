@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import json
 import os
@@ -28,8 +27,7 @@ from agent_utils.core.io import IoRequest, OpId
 from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import State
 from agent_utils.features.core import IoFence
-from agent_utils.runtime.driver import Driver
-from agent_zoo.core.feature_state import session_state
+from agent_zoo.durability import ThreadPoolDriver, session_state
 from agent_zoo.events import SessionReady
 from agent_zoo.features.turn.llm_caller import LLMCaller
 
@@ -221,85 +219,27 @@ class BridgeService:
                 self.endpoint = ""
 
 
-class BridgeDriver(Driver):
+class BridgeDriver(ThreadPoolDriver):
     """Non-blocking process-bound IO driver privately owning ``BridgeService``."""
 
     durability = "process_bound"
     request_types = (StartBridge, ValidateBridge)
+    max_workers = 1
+    worker_prefix = "claude-sdk-bridge"
+    interrupt_on_quiesce = True
 
     def __init__(self, *, root: str | Path | None = None) -> None:
         super().__init__()
         self._service = BridgeService(root)
-        self._lock = threading.RLock()
-        self._executor: ThreadPoolExecutor | None = None
-        self._futures: dict[OpId, Future[Any]] = {}
-        self._cancelled: set[OpId] = set()
-        self._closed = False
 
-    def start(self, emit: EmitFn) -> None:
-        super().start(emit)
-        with self._lock:
-            self._closed = False
-            if self._executor is None:
-                self._executor = ThreadPoolExecutor(
-                    max_workers=1,
-                    thread_name_prefix="claude-sdk-bridge",
-                )
-
-    def submit(self, op_id: OpId, req: IoRequest) -> None:
-        if not isinstance(req, (StartBridge, ValidateBridge)):
+    def execute(self, req: IoRequest) -> dict[str, str]:
+        if isinstance(req, StartBridge):
+            endpoint, env_name = self._service.start()
+        elif isinstance(req, ValidateBridge):
+            endpoint, env_name = self._service.validate()
+        else:
             raise TypeError(f"Unsupported bridge request: {type(req).__name__}")
-        with self._lock:
-            if self._closed:
-                return
-            if self._executor is None:
-                self._executor = ThreadPoolExecutor(
-                    max_workers=1,
-                    thread_name_prefix="claude-sdk-bridge",
-                )
-            fut = self._executor.submit(self._run_op, op_id, req)
-            self._futures[op_id] = fut
-
-    def _run_op(self, op_id: OpId, req: IoRequest) -> None:
-        with self._lock:
-            if self._closed or op_id in self._cancelled:
-                self._futures.pop(op_id, None)
-                self._cancelled.discard(op_id)
-                return
-        try:
-            if isinstance(req, StartBridge):
-                endpoint, env_name = self._service.start()
-            elif isinstance(req, ValidateBridge):
-                endpoint, env_name = self._service.validate()
-            else:
-                raise TypeError(f"Unsupported bridge request: {type(req).__name__}")
-        except Exception as exc:
-            with self._lock:
-                self._futures.pop(op_id, None)
-                cancelled = self._closed or op_id in self._cancelled
-                self._cancelled.discard(op_id)
-            if not cancelled:
-                self._safe_emit(IoFailed(op_id=op_id, error=exc))
-            return
-
-        with self._lock:
-            self._futures.pop(op_id, None)
-            cancelled = self._closed or op_id in self._cancelled
-            self._cancelled.discard(op_id)
-        if not cancelled:
-            self._safe_emit(
-                IoCompleted(
-                    op_id=op_id,
-                    value={"endpoint": endpoint, "env_name": env_name},
-                )
-            )
-
-    def cancel(self, op_id: OpId) -> None:
-        with self._lock:
-            self._cancelled.add(op_id)
-            fut = self._futures.pop(op_id, None)
-        if fut is not None:
-            fut.cancel()
+        return {"endpoint": endpoint, "env_name": env_name}
 
     def quiesce(
         self,
@@ -307,39 +247,14 @@ class BridgeDriver(Driver):
         policy: str = "terminate",
         deadline: float | None = None,
     ) -> list[Event]:
-        del policy, deadline
-        interrupted: list[Event] = []
-        with self._lock:
-            active_items = [
-                (op_id, fut)
-                for op_id, fut in list(self._futures.items())
-                if op_id not in self._cancelled
-            ]
-            for op_id, _fut in active_items:
-                self._cancelled.add(op_id)
-                self._futures.pop(op_id, None)
-                interrupted.append(IoInterrupted(op_id=op_id, reason="shutdown"))
-        for _op_id, fut in active_items:
-            fut.cancel()
-        return interrupted
+        return super().quiesce(
+            policy=policy,
+            deadline=time.monotonic() if deadline is None else deadline,
+        )
 
-    def close(self) -> None:
-        with self._lock:
-            self._closed = True
-            active_items = list(self._futures.items())
-            for op_id, _fut in active_items:
-                self._cancelled.add(op_id)
-            self._futures.clear()
-            executor = self._executor
-            self._executor = None
-        for _op_id, fut in active_items:
-            fut.cancel()
+    def on_close(self) -> None:
         self._service.request_stop()
-        try:
-            self._service.cleanup()
-        finally:
-            if executor is not None:
-                executor.shutdown(wait=True, cancel_futures=True)
+        self._service.cleanup()
 
 
 def _clean_headers(headers: dict[str, Any] | None) -> dict[str, Any]:
@@ -506,8 +421,7 @@ class ManagedBridge:
         self.verify_config(rt)
 
 
-def register_features(builder: Any, *, session: Any, config: dict[str, Any]) -> None:
-    del session
+def register_features(builder: Any, *, config: dict[str, Any]) -> None:
     from agent_zoo.llm import enabled_llm_models
 
     # Missing registry is normal in inspector/minimal configurations.

@@ -142,7 +142,7 @@ def config():
 def build_runtime(plugin, cfg, root=None):
     session = Session()
     builder = PipelineBuilder().add(core_feature())
-    plugin.register_features(builder, session=session, config=cfg)
+    plugin.register_features(builder, config=cfg)
     session.pipeline = builder.build(suppress_warnings=True)
     drivers = builder.build_drivers(cfg)
     handler = next(c for c in session.pipeline.components if isinstance(c, plugin.ManagedBridge))
@@ -224,7 +224,7 @@ def test_feature_builds_through_real_pipeline_builder_and_default_builder(plugin
     builder = build_default_builder(
         session, config=config(), include_plugins=False, include_llm_drivers=False,
     )
-    plugin.register_features(builder, session=session, config=config())
+    plugin.register_features(builder, config=config())
     session.pipeline = builder.build()
     session.ensure_initialized()
     assert not hasattr(session.state, "claude_sdk_bridge_service")
@@ -242,7 +242,7 @@ def test_feature_builds_through_real_pipeline_builder_and_default_builder(plugin
 def test_disabled_and_other_profiles_do_not_register(plugin, cfg):
     original = copy.deepcopy(cfg)
     features = []
-    plugin.register_features(SimpleNamespace(add=features.append), session=Session(), config=cfg)
+    plugin.register_features(SimpleNamespace(add=features.append), config=cfg)
     assert not features
     assert cfg == original
 
