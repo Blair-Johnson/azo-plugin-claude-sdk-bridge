@@ -247,10 +247,10 @@ class BridgeDriver(ThreadPoolDriver):
         policy: str = "terminate",
         deadline: float | None = None,
     ) -> list[Event]:
-        return super().quiesce(
-            policy=policy,
-            deadline=time.monotonic() if deadline is None else deadline,
-        )
+        request_stop = getattr(self._service, "request_stop", None)
+        if callable(request_stop):
+            request_stop()
+        return super().quiesce(policy=policy, deadline=deadline)
 
     def on_close(self) -> None:
         self._service.request_stop()

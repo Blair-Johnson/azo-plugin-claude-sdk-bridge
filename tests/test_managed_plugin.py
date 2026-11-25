@@ -277,6 +277,28 @@ def test_driver_submit_is_non_blocking_and_quiesce_interrupts(plugin, monkeypatc
         driver.close()
 
 
+def test_driver_quiesce_calls_request_stop_to_unblock_inflight_start(plugin, fake_bridge, monkeypatch):
+    monkeypatch.setattr(plugin, "STARTUP_TIMEOUT", 5.0)
+    driver = plugin.BridgeDriver(root=fake_bridge("partial"))
+    emitted = []
+    driver.start(emitted.append)
+    try:
+        driver.submit("g1:op_slow", plugin.StartBridge(session_id="s-slow"))
+        # Wait briefly so BridgeService.start() enters _read_ready().
+        deadline = time.monotonic() + 2.0
+        while driver._service.process is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert driver._service.process is not None
+        t0 = time.monotonic()
+        driver.quiesce(policy="terminate", deadline=time.monotonic() + 3.0)
+        elapsed = time.monotonic() - t0
+        # request_stop() must wake _read_ready() promptly instead of waiting 3s/5s.
+        assert elapsed < 1.0
+        assert driver._service._stop_event.is_set()
+    finally:
+        driver.close()
+
+
 def test_cold_bind_shares_private_config_before_worker_and_runtime_exit_cleans(plugin, fake_bridge, monkeypatch):
     from agent_zoo.llm.catalog import _normalize_provider_sections
     from agent_zoo.features.turn.llm_caller import LLMCaller
