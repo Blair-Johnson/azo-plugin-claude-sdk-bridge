@@ -115,6 +115,38 @@ test('EOF before any control frame exits quietly', async t => {
   await stopped(run);
 });
 
+test('forwards idleSeconds from control frame to BridgeManager as idleMs', async t => {
+  const setup = await fixture(t, {
+    engine: `
+      import { writeFile } from 'node:fs/promises';
+      export class BridgeManager {
+        sessions = new Map();
+        constructor(options) {
+          this.readyWrite = writeFile(new URL('./options.json', import.meta.url), JSON.stringify(options));
+        }
+        async close() { await this.readyWrite; }
+      }
+    `,
+    server: `
+      import { EventEmitter } from 'node:events';
+      export function createBridgeServer({ manager }) {
+        return {
+          server: new EventEmitter(),
+          async listen() { return { port: 12345 }; },
+          async close() { await manager.close(); },
+        };
+      }
+    `,
+  });
+  const run = launch(t, setup.script, { detached: false });
+  run.child.stdin.write(frame({ idleSeconds: 7200 }));
+  await run.ready;
+  run.child.stdin.end();
+  await stopped(run, 0, true);
+  const options = JSON.parse(await readFile(join(setup.dir, 'options.json'), 'utf8'));
+  assert.equal(options.idleMs, 7200000);
+});
+
 const invalidFrames = [
   ['invalid JSON', '{private malformed payload}\n'],
   ['null', 'null\n'], ['array', '[]\n'],
@@ -123,6 +155,12 @@ const invalidFrames = [
   ['port', frame({ port: 1234 })], ['string port', frame({ port: '0' })],
   ['prompt mode', frame({ systemPromptMode: 'invalid' })],
   ['interrupt mode', frame({ interruptMode: null })],
+  ['idleSeconds zero', frame({ idleSeconds: 0 })],
+  ['idleSeconds negative', frame({ idleSeconds: -5 })],
+  ['idleSeconds above max', frame({ idleSeconds: 86401 })],
+  ['idleSeconds float', frame({ idleSeconds: 1.5 })],
+  ['idleSeconds string', frame({ idleSeconds: '3600' })],
+  ['idleSeconds null', frame({ idleSeconds: null })],
   ['unknown field', frame({ host: '0.0.0.0' })],
   ['private-group flag type', frame({ ownedProcessGroup: 'true' })],
   ['multiple frames', frame() + frame()],

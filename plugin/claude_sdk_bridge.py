@@ -27,11 +27,23 @@ from agent_utils.core.io import IoRequest, OpId
 from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import State
 from agent_utils.features.core import IoFence
-from agent_zoo.durability import ThreadPoolDriver, session_state
+from agent_zoo.durability import (
+    PluginConfigBox,
+    PluginStorage,
+    ThreadPoolDriver,
+    session_state,
+)
 from agent_zoo.events import SessionReady
+from agent_zoo.features.settings import Setting, SettingError
 from agent_zoo.features.turn.llm_caller import LLMCaller
 
 
+PLUGIN_NAME = "claude_sdk_bridge"
+REPO_PLUGIN_NAME = "azo-plugin-claude-sdk-bridge"
+CONFIG_RELATIVE = "config/claude_sdk_bridge.json"
+DEFAULT_IDLE_SECONDS = 3600
+MIN_IDLE_SECONDS = 1
+MAX_IDLE_SECONDS = 86400
 RUNTIME_KEY = "claude_sdk_bridge"
 READINESS_KEY = "claude_sdk_bridge"
 STARTUP_TIMEOUT = 10.0
@@ -40,11 +52,69 @@ GRACEFUL_SHUTDOWN_TIMEOUT = 6.0
 _AUTH_HEADERS = {"authorization", "proxy-authorization", "x-api-key", "x-azo-session-id", "host"}
 
 
+def _defaults_path() -> Path:
+    return PluginStorage(REPO_PLUGIN_NAME, config_filename=CONFIG_RELATIVE).config.path
+
+
+def _validate_config_doc(document: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(document, dict) or not isinstance(document.get(PLUGIN_NAME, {}), dict):
+        raise ValueError("Cannot read Claude SDK bridge defaults; repair the file before editing.")
+    return dict(document)
+
+
+def _load_config_box() -> PluginConfigBox:
+    return PluginConfigBox(
+        REPO_PLUGIN_NAME,
+        config_filename=CONFIG_RELATIVE,
+        validate=_validate_config_doc,
+    )
+
+
+def _validate_idle_seconds(value: Any) -> int:
+    if type(value) is not int or not (MIN_IDLE_SECONDS <= value <= MAX_IDLE_SECONDS):
+        raise SettingError(
+            f"Idle session eviction timeout must be an integer between {MIN_IDLE_SECONDS} and {MAX_IDLE_SECONDS} seconds."
+        )
+    return value
+
+
+def _read_idle_seconds(box: PluginConfigBox) -> int:
+    document = box.require_loaded()
+    raw = document.get(PLUGIN_NAME, {}).get("idle_seconds", DEFAULT_IDLE_SECONDS)
+    return _validate_idle_seconds(raw)
+
+
+def _write_idle_seconds(ctx: Any, box: PluginConfigBox, value: Any) -> None:
+    validated = _validate_idle_seconds(value)
+
+    def _update(doc: dict[str, Any]) -> dict[str, Any]:
+        section = dict(doc.get(PLUGIN_NAME, {}))
+        section["idle_seconds"] = validated
+        doc[PLUGIN_NAME] = section
+        return doc
+
+    box.mutate(ctx, _update)
+
+
+def _resolve_idle_seconds(config: dict[str, Any], box: PluginConfigBox) -> int:
+    plugin_cfg = config.get(PLUGIN_NAME)
+    if isinstance(plugin_cfg, dict) and "idle_seconds" in plugin_cfg:
+        raw = plugin_cfg["idle_seconds"]
+        if type(raw) is int and MIN_IDLE_SECONDS <= raw <= MAX_IDLE_SECONDS:
+            return raw
+    if box.load_error is None:
+        raw = box.data.get(PLUGIN_NAME, {}).get("idle_seconds", DEFAULT_IDLE_SECONDS)
+        if type(raw) is int and MIN_IDLE_SECONDS <= raw <= MAX_IDLE_SECONDS:
+            return raw
+    return DEFAULT_IDLE_SECONDS
+
+
 @dataclass
 class StartBridge(IoRequest):
     """Start (or validate an already-live) backend-owned Claude SDK bridge."""
 
     session_id: str = ""
+    idle_seconds: int = DEFAULT_IDLE_SECONDS
 
 
 @dataclass
@@ -75,8 +145,14 @@ def bridge_runtime(state: State) -> BridgeRuntimeState:
 class BridgeService:
     """Private process-bound bridge owner managed exclusively by ``BridgeDriver``."""
 
-    def __init__(self, root: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        root: str | Path | None = None,
+        *,
+        idle_seconds: int = DEFAULT_IDLE_SECONDS,
+    ) -> None:
         self.root = Path(root) if root is not None else Path(__file__).resolve().parents[1]
+        self.idle_seconds = _validate_idle_seconds(idle_seconds)
         self.process: subprocess.Popen[bytes] | None = None
         self.owner_pid: int | None = None
         self.endpoint = ""
@@ -126,9 +202,14 @@ class BridgeService:
                     stderr=subprocess.DEVNULL, start_new_session=True, bufsize=0,
                 )
                 assert self.process.stdin is not None
-                self.process.stdin.write(
-                    (json.dumps({"version": 1, "key": self._key, "port": 0, "ownedProcessGroup": True}) + "\n").encode()
-                )
+                control_frame = {
+                    "version": 1,
+                    "key": self._key,
+                    "port": 0,
+                    "ownedProcessGroup": True,
+                    "idleSeconds": self.idle_seconds,
+                }
+                self.process.stdin.write((json.dumps(control_frame) + "\n").encode())
                 ready = self._read_ready()
                 if (not isinstance(ready, dict) or ready.get("kind") != "ready"
                         or type(ready.get("version")) is not int or ready["version"] != 1
@@ -228,12 +309,19 @@ class BridgeDriver(ThreadPoolDriver):
     worker_prefix = "claude-sdk-bridge"
     interrupt_on_quiesce = True
 
-    def __init__(self, *, root: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        root: str | Path | None = None,
+        idle_seconds: int = DEFAULT_IDLE_SECONDS,
+    ) -> None:
         super().__init__()
-        self._service = BridgeService(root)
+        self._service = BridgeService(root, idle_seconds=idle_seconds)
 
     def execute(self, req: IoRequest) -> dict[str, str]:
         if isinstance(req, StartBridge):
+            if self._service.process is None:
+                self._service.idle_seconds = _validate_idle_seconds(req.idle_seconds)
             endpoint, env_name = self._service.start()
         elif isinstance(req, ValidateBridge):
             endpoint, env_name = self._service.validate()
@@ -273,9 +361,12 @@ class ManagedBridge:
         self,
         config: dict[str, Any],
         profiles: list[str],
+        *,
+        idle_seconds: int = DEFAULT_IDLE_SECONDS,
     ) -> None:
         self.config = config
         self.profiles = list(profiles)
+        self.idle_seconds = _validate_idle_seconds(idle_seconds)
 
     def _clients(self):
         # enabled_llm_models returns copies. Always edit the original registry:
@@ -350,7 +441,10 @@ class ManagedBridge:
 
         rt.session_id = session_id
         rt.last_error = None
-        op_id = state.io.submit(StartBridge(session_id=session_id), tag=RUNTIME_KEY)
+        op_id = state.io.submit(
+            StartBridge(session_id=session_id, idle_seconds=self.idle_seconds),
+            tag=RUNTIME_KEY,
+        )
         rt.pending_op = op_id
         state.readiness.hold(READINESS_KEY, "Starting Claude SDK bridge")
 
@@ -434,10 +528,35 @@ def register_features(builder: Any, *, config: dict[str, Any]) -> None:
         if "sdk-bridge" in tags or entry.get("tag") == "sdk-bridge":
             profiles.append(name)
     if profiles:
+        box = _load_config_box()
+        idle_seconds = _resolve_idle_seconds(config, box)
+        idle_setting = Setting(
+            "claude_sdk_bridge.idle_seconds",
+            "Idle session eviction timeout (s)",
+            "int",
+            get=lambda ctx, b=box: _read_idle_seconds(b),
+            set=lambda ctx, value, b=box: _write_idle_seconds(ctx, b, value),
+            group="Claude SDK bridge",
+            apply="reload",
+            help=(
+                "Seconds before evicting an idle Claude SDK mirror session "
+                f"(default {DEFAULT_IDLE_SECONDS}s to match the 1-hour prompt cache TTL). "
+                "Reload to apply; explicit runtime configuration takes precedence."
+            ),
+            min=MIN_IDLE_SECONDS,
+            max=MAX_IDLE_SECONDS,
+        )
+        builder.add(
+            Feature(
+                name="claude_sdk_bridge_settings",
+                components=[idle_setting],
+                order=[Setting],
+            )
+        )
         builder.add(
             Feature(
                 name="claude_sdk_bridge",
-                components=[ManagedBridge(config, profiles)],
+                components=[ManagedBridge(config, profiles, idle_seconds=idle_seconds)],
                 order=[IoFence, ManagedBridge, LLMCaller],
                 drivers=[BridgeDriver],
             )

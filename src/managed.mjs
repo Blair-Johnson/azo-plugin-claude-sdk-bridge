@@ -70,14 +70,15 @@ process.stdin.on('error', () => stop(1));
 process.stdout.on('error', () => stop(1));
 
 function validate(frame) {
-  const allowed = ['version', 'key', 'port', 'systemPromptMode', 'interruptMode', 'ownedProcessGroup'];
+  const allowed = ['version', 'key', 'port', 'systemPromptMode', 'interruptMode', 'ownedProcessGroup', 'idleSeconds'];
   if (!frame || typeof frame !== 'object' || Array.isArray(frame)
       || Object.keys(frame).some(key => !allowed.includes(key))
       || frame.version !== 1 || frame.port !== 0
       || typeof frame.key !== 'string' || !/^[a-f0-9]{64}$/i.test(frame.key)
       || ('ownedProcessGroup' in frame && typeof frame.ownedProcessGroup !== 'boolean')
       || ('systemPromptMode' in frame && !['append', 'custom'].includes(frame.systemPromptMode))
-      || ('interruptMode' in frame && !['rollback', 'reuse', 'rebuild'].includes(frame.interruptMode))) {
+      || ('interruptMode' in frame && !['rollback', 'reuse', 'rebuild'].includes(frame.interruptMode))
+      || ('idleSeconds' in frame && (!Number.isSafeInteger(frame.idleSeconds) || frame.idleSeconds < 1 || frame.idleSeconds > 86400))) {
     throw new Error('Invalid control frame');
   }
   return frame;
@@ -92,7 +93,8 @@ async function start(frame) {
     import('./engine.mjs'), import('./server.mjs'),
   ]);
   if (stopping) return;
-  manager = new BridgeManager({ systemPromptMode: frame.systemPromptMode, interruptMode: frame.interruptMode });
+  const idleMs = frame.idleSeconds !== undefined ? frame.idleSeconds * 1000 : undefined;
+  manager = new BridgeManager({ idleMs, systemPromptMode: frame.systemPromptMode, interruptMode: frame.interruptMode });
   endpoint = createBridgeServer({ manager, key: frame.key });
   endpoint.server.on('error', () => stop(1));
   const address = await endpoint.listen(0);

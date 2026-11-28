@@ -81,7 +81,7 @@ The resume point is validated by the bridge after the old process has exited: ev
 
 Normal managed use does not need this server. For isolated transport debugging, `pixi run start --key-file /path/to/private/diagnostic-key --port 8766` runs the foreground CLI. Supply a separately prepared mode-0600 loopback key and a separate diagnostic client pointed at that exact URL and key; the managed example's port-1 placeholder is not a standalone-server configuration. Do not put diagnostic credentials into your normal managed profiles. Stop the foreground server with Ctrl-C.
 
-The standalone CLI binds only `127.0.0.1`. Options include `--port`, `--idle-seconds` (default 300), `--timeout-seconds` (0, meaning no total request deadline; client disconnects still cancel inference), and `--system-prompt-mode` (`append` or `custom`). `GET /health` requires the local `x-api-key`; `DELETE /v1/session` additionally requires `x-azo-session-id` and explicitly cancels that SDK session. There is no unauthenticated management endpoint or CORS access. These CLI controls are diagnostic options, not flags to pass to `azo`.
+The standalone CLI binds only `127.0.0.1`. Options include `--port`, `--idle-seconds` (default 3600; also configurable via `/config` as `claude_sdk_bridge.idle_seconds`), `--timeout-seconds` (0, meaning no total request deadline; client disconnects still cancel inference), and `--system-prompt-mode` (`append` or `custom`). `GET /health` requires the local `x-api-key`; `DELETE /v1/session` additionally requires `x-azo-session-id` and explicitly cancels that SDK session. There is no unauthenticated management endpoint or CORS access. These CLI controls are diagnostic options, not flags to pass to `azo`.
 
 ## Tests and reference map
 

@@ -240,7 +240,7 @@ function foldTrailingContent(content, resultCount) {
 export const INTERRUPT_MODES = ['rollback', 'reuse', 'rebuild'];
 /** Agent Zoo owns history and tools. SDK sessions are disposable mirrors only. */
 export class BridgeManager {
-  constructor({ queryFactory, stateRoot, idleMs = 300000,
+  constructor({ queryFactory, stateRoot, idleMs = 3600000,
     requestTimeoutMs = 0, historyImporter = importSession,
     processFactory = () => new QueryProcess(), env = process.env, systemPromptMode = 'append',
     interruptMode = 'rollback', interruptTimeoutMs = 500 } = {}) {

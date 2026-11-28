@@ -624,3 +624,78 @@ def test_before_llm_gated_via_readiness_and_released_on_complete_or_interrupt(pl
     assert rt2.pending_op is None
     assert rt2.bound is False
     assert session2.state.readiness.is_ready
+
+
+def test_config_setting_default_persistence_and_control_frame_forwarding(plugin, fake_bridge, tmp_path, monkeypatch):
+    from agent_zoo.durability import PluginStoreDriver, StoreUpdate
+    from agent_zoo.features.settings import Setting, SettingsContext, SettingsRegistry
+
+    monkeypatch.setenv("AGENT_ZOO_HOME", str(tmp_path))
+    cfg = config()
+    original = copy.deepcopy(cfg)
+    session, _runtime, handler, _driver = build_runtime(plugin, cfg)
+    assert handler.idle_seconds == 3600
+
+    registry = SettingsRegistry([c for c in session.pipeline.components if isinstance(c, Setting)])
+    ctx = SettingsContext(state=session.state, emit=lambda _ev: None)
+    listed = registry.handle({"type": "plugin_settings", "action": "list", "request_id": "list-1"}, ctx)
+    assert listed["ok"]
+    row = next(r for r in listed["settings"] if r["key"] == "claude_sdk_bridge.idle_seconds")
+    assert row["value"] == 3600
+    assert row["writable"] is True
+    assert row["apply"] == "reload"
+    assert row["min"] == 1 and row["max"] == 86400
+
+    bad = registry.handle(
+        {
+            "type": "plugin_settings",
+            "action": "set",
+            "request_id": "bad-1",
+            "binding": registry.binding,
+            "key": "claude_sdk_bridge.idle_seconds",
+            "value": 0,
+        },
+        ctx,
+    )
+    assert not bad["ok"]
+
+    updated = registry.handle(
+        {
+            "type": "plugin_settings",
+            "action": "set",
+            "request_id": "set-1",
+            "binding": registry.binding,
+            "key": "claude_sdk_bridge.idle_seconds",
+            "value": 5400,
+        },
+        ctx,
+    )
+    assert updated["ok"]
+    store_driver = PluginStoreDriver(state_root=tmp_path)
+    store_reqs = [eff.request for eff in ctx.state.io.take_outbox() if isinstance(eff.request, StoreUpdate)]
+    assert len(store_reqs) == 1
+    store_driver.execute(store_reqs[0])
+    assert json.loads(plugin._defaults_path().read_text())["claude_sdk_bridge"]["idle_seconds"] == 5400
+    assert cfg == original
+
+    # Reload picks up persisted setting and sends idleSeconds in the managed.mjs control frame.
+    root = fake_bridge()
+    frame_log = root / "control-frame.json"
+    (root / "src/managed.mjs").write_text(
+        (root / "src/managed.mjs").read_text().replace(
+            "const config = JSON.parse(input.split('\\n')[0]);",
+            f"const config = JSON.parse(input.split('\\n')[0]);\n  import('node:fs').then(fs => fs.writeFileSync({json.dumps(str(frame_log))}, JSON.stringify(config)));",
+        )
+    )
+    _s2, runtime2, handler2, driver2 = build_runtime(plugin, copy.deepcopy(original), root)
+    assert handler2.idle_seconds == 5400
+    with runtime2:
+        emit_ready(runtime2)
+        assert driver2._service.idle_seconds == 5400
+    assert json.loads(frame_log.read_text())["idleSeconds"] == 5400
+
+    # Explicit runtime config override takes precedence over saved defaults.
+    override_cfg = copy.deepcopy(original)
+    override_cfg["claude_sdk_bridge"] = {"idle_seconds": 1800}
+    _s3, _rt3, handler3, _drv3 = build_runtime(plugin, override_cfg)
+    assert handler3.idle_seconds == 1800

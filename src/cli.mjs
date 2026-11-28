@@ -6,7 +6,7 @@ const { values } = parseArgs({ options: {
   help: { type: 'boolean', short: 'h' },
   port: { type: 'string', default: '8766' },
   'key-file': { type: 'string' },
-  'idle-seconds': { type: 'string', default: '300' },
+  'idle-seconds': { type: 'string', default: '3600' },
   'timeout-seconds': { type: 'string', default: '0' },
   'system-prompt-mode': { type: 'string', default: 'append' },
   'interrupt-mode': { type: 'string', default: 'rollback' },
@@ -15,7 +15,7 @@ if (values.help) {
   console.log('Agent Zoo Claude SDK bridge (opt-in, loopback only)\n' +
     'Usage: pixi run start [--port 8766] [--key-file PATH]\n' +
     'Local key: AZO_CLAUDE_BRIDGE_KEY, minimum 32 characters; never a Claude credential.\n' +
-    'Controls: --idle-seconds 300 --timeout-seconds 0 (no total deadline)\n' +
+    'Controls: --idle-seconds 3600 --timeout-seconds 0 (no total deadline)\n' +
     'Prompt: --system-prompt-mode append (reference default) or custom\n' +
     'Interruption: --interrupt-mode rollback (default), reuse, or rebuild\n' +
     'Uses the Claude Agent SDK login. Does not enable or change extra-usage settings.');
